@@ -24,3 +24,7 @@ htmlcov/
 *.sqlite3
 *.log
 logs/
+
+# Local audit reports
+/docs/RUNTIME_CHECK.md
+/docs/TZ_AUDIT.md
