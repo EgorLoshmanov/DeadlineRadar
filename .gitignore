@@ -1,3 +1,26 @@
 # macOS metadata
 .DS_Store
 ._*
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases and runtime output
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+logs/
