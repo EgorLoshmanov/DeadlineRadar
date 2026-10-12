@@ -57,7 +57,7 @@ def deadline_list(items: list[dict], now: datetime, *, completed: bool = False,
 
 
 def reminder_text(item: dict) -> str:
-    days = "3 дня" if item["days_before"] == 3 else "1 день"
+    days = "3 дней" if item["days_before"] == 3 else "1 дня"
     return (f"🔔 <b>До дедлайна не больше {days}</b>\n\n"
             f"📚 {escape(item['subject'])}\n📝 {escape(item['task'])}\n"
             f"⏰ {format_date(item['due_date'])}\n\n"
