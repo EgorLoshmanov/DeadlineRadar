@@ -163,11 +163,12 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
         page = min(max(page, 0), pages - 1)
         visible = items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+        start_number = page * PAGE_SIZE + 1
         rows = []
-        for item in visible:
-            buttons = [] if history else [(f"✅ Я сдал #{item['id']}", f"done:{item['id']}")]
+        for number, item in enumerate(visible, start=start_number):
+            buttons = [] if history else [(f"✅ Я сдал #{number}", f"done:{item['id']}")]
             if item["can_delete"]:
-                buttons.append((f"🗑 #{item['id']}", f"remove:ask:{item['id']}"))
+                buttons.append((f"🗑 #{number}", f"remove:ask:{item['id']}"))
             if buttons:
                 rows.append(buttons)
         navigation = []
@@ -178,7 +179,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         if navigation:
             rows.append(navigation)
         rows.append([("🔄 Обновить", f"list:{int(history)}:{page}")])
-        text = deadline_list(visible, settings.now(), completed=history)
+        text = deadline_list(visible, settings.now(), completed=history, start_number=start_number)
         if len(items) > PAGE_SIZE:
             text += f"\n\nСтраница {page + 1}/{pages} · всего {len(items)}"
         await message.answer(text, reply_markup=inline(rows))
@@ -455,7 +456,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         _, action, token = query.data.split(":", 2)
         data = await state.get_data()
         if data.get("saved_token") == token and action == "save":
-            await answer_callback(query, f"Уже сохранено: #{data['saved_id']}")
+            await answer_callback(query, "Уже сохранено. Задание доступно в /deadlines.")
             return
         if token != data.get("preview_token") or await state.get_state() != Flow.preview.state:
             await answer_callback(query, "Эта карточка устарела. Откройте текущую или начните заново.", show_alert=True)
@@ -473,7 +474,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
                 await on_publication(item["id"])
             await answer_callback(query, "Сохранено")
             await clear_buttons(query.message)
-            await query.message.answer(f"✅ Дедлайн #{item['id']} сохранён. /deadlines — список заданий.")
+            await query.message.answer("✅ Дедлайн сохранён. /deadlines — список заданий.")
             if item["group_id"] is not None and on_publication is None:
                 await publications.tick(lambda row: send_group_publication(query.bot, row), deadline_id=item["id"])
         elif action == "cancel":
@@ -527,9 +528,11 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         if action == "ask":
             suffix = " Удалится у всех участников группы." if item["group_id"] else ""
             await answer_callback(query)
-            await query.message.answer(f"Удалить задание #{deadline_id}?{suffix}", reply_markup=inline([
-                [("Удалить", f"remove:yes:{deadline_id}"), ("Отмена", "dismiss")],
-            ]))
+            await query.message.answer(
+                f"Удалить задание?{suffix}\n\n📚 {escape(item['subject'])}\n📝 {escape(item['task'])}",
+                reply_markup=inline([
+                    [("Удалить", f"remove:yes:{deadline_id}"), ("Отмена", "dismiss")],
+                ]))
         elif action == "yes":
             database.delete_deadline(query.from_user.id, deadline_id)
             await answer_callback(query, "Удалено")

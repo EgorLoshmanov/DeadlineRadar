@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -190,6 +191,79 @@ class BotConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["subject"], "Базы данных")
         self.assertEqual(items[0]["due_date"], "2026-10-15 18:00")
         self.assertIn("Уже сохранено", self.session.last_callback_answer().text)
+
+    async def test_new_active_list_restarts_after_all_previous_tasks_are_completed(self) -> None:
+        for number in range(4):
+            item = self.db.create_deadline(1, "Физика", f"Сданная работа {number}",
+                                           self.now + timedelta(days=1))
+            self.db.complete_deadline(1, item["id"])
+        preview = await self.preview()
+        save = self.button(preview, "draft:save:")
+        await self.click(save, message=preview)
+        saved = self.session.last_message()
+        self.assertIn("Дедлайн сохранён", saved.text)
+        self.assertNotIn("#5", saved.text)
+        item = self.db.list_deadlines(1)[0]
+        self.assertEqual(item["id"], 5)
+
+        listing = await self.send("/deadlines")
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", listing.text), ["1"])
+        button = next(button for row in listing.reply_markup.inline_keyboard for button in row
+                      if button.callback_data.startswith("done:"))
+        self.assertEqual(button.text, "✅ Я сдал #1")
+        self.assertEqual(button.callback_data, "done:5")
+        await self.click(button.callback_data, message=listing)
+        self.assertTrue(self.db.get_deadline(1, 5)["completed"])
+        self.assertIn("Пока пусто", self.session.last_message().text)
+
+        history = await self.send("/history")
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", history.text), ["1", "2", "3", "4"])
+        await self.click("list:1:1", message=history)
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", self.session.last_message().text), ["5"])
+
+    async def test_numbering_spans_pages_and_old_buttons_keep_their_original_target(self) -> None:
+        for number in range(3):
+            self.db.create_deadline(2, "Другой студент", f"Работа {number}",
+                                    self.now + timedelta(days=1))
+        items = [self.db.create_deadline(1, "Физика", f"Работа {number}",
+                                        self.now + timedelta(days=number + 1))
+                 for number in range(6)]
+        first = await self.send("/deadlines")
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", first.text), ["1", "2", "3", "4"])
+        await self.click("list:0:1", message=first)
+        second = self.session.last_message()
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", second.text), ["5", "6"])
+        buttons = [button for row in second.reply_markup.inline_keyboard for button in row
+                   if button.callback_data.startswith("done:")]
+        self.assertEqual([button.text for button in buttons], ["✅ Я сдал #5", "✅ Я сдал #6"])
+        self.assertEqual(buttons[0].callback_data, f"done:{items[4]['id']}")
+
+        await self.click(self.button(first, "done:"), message=first)
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", self.session.last_message().text),
+                         ["1", "2", "3", "4"])
+        await self.click(buttons[0].callback_data, message=second)
+        self.assertTrue(self.db.get_deadline(1, items[4]["id"])["completed"])
+        self.assertFalse(self.db.get_deadline(1, items[5]["id"])["completed"])
+
+    async def test_delete_confirmation_names_task_and_numbers_close_gap(self) -> None:
+        old = self.db.create_deadline(1, "Физика", "Сданная работа", self.now + timedelta(days=1))
+        self.db.complete_deadline(1, old["id"])
+        remove = self.db.create_deadline(1, "<БД>", "Код & отчёт", self.now + timedelta(days=2))
+        remaining = self.db.create_deadline(1, "Питон", "Код", self.now + timedelta(days=3))
+        listing = await self.send("/deadlines")
+        buttons = [button for row in listing.reply_markup.inline_keyboard for button in row
+                   if button.callback_data.startswith("remove:ask:")]
+        self.assertEqual([button.text for button in buttons], ["🗑 #1", "🗑 #2"])
+        self.assertEqual(buttons[0].callback_data, f"remove:ask:{remove['id']}")
+        await self.click(buttons[0].callback_data, message=listing)
+        confirmation = self.session.last_message()
+        self.assertIn("&lt;БД&gt;", confirmation.text)
+        self.assertIn("Код &amp; отчёт", confirmation.text)
+        await self.click(self.button(confirmation, "remove:yes:"), message=confirmation)
+        self.assertIsNone(self.db.get_deadline(1, remove["id"]))
+        refreshed = self.session.last_message()
+        self.assertEqual(re.findall(r"<b>#(\d+) ·", refreshed.text), ["1"])
+        self.assertEqual(self.button(refreshed, "done:"), f"done:{remaining['id']}")
 
     async def test_publication_notifies_member_once_and_done_is_individual(self) -> None:
         group = await self.shared_group()

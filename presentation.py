@@ -37,20 +37,21 @@ def urgency(value: str, now: datetime) -> str:
     return "🔵 Позже"
 
 
-def deadline_list(items: list[dict], now: datetime, *, completed: bool = False) -> str:
+def deadline_list(items: list[dict], now: datetime, *, completed: bool = False,
+                  start_number: int = 1) -> str:
     title = "✅ Сданные задания" if completed else "📋 Активные дедлайны"
     if not items:
         return f"<b>{title}</b>\n\n" + ("Сданных заданий пока нет." if completed else
             "Пока пусто. Перешлите сообщение с заданием или нажмите «Добавить вручную».")
     lines = [f"<b>{title}</b>", ""]
     previous = None
-    for item in items:
+    for number, item in enumerate(items, start=start_number):
         heading = "✅ Сдано" if completed else urgency(item["due_date"], now)
         if heading != previous:
             lines.extend([f"<b>{heading}</b>", ""])
             previous = heading
         scope = " · " + escape(item["group_name"]) if item.get("group_name") else " · личное"
-        lines.extend([f"<b>#{item['id']} · {escape(item['subject'])}</b>{scope}",
+        lines.extend([f"<b>#{number} · {escape(item['subject'])}</b>{scope}",
                       escape(item["task"]), f"⏰ {format_date(item['due_date'])}", ""])
     return "\n".join(lines).rstrip()
 
