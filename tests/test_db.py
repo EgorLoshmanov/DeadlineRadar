@@ -388,6 +388,46 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.db.disable_delivery_for_reminder(deadline["id"], 1, 3, claim_token=token))
         self.assertTrue(self.db.get_user(1)["delivery_enabled"])
 
+    def test_delivery_revision_migrates_without_replaying_completed_deliveries(self) -> None:
+        personal = self.deadline()
+        group = self.group()
+        shared = self.deadline(group_id=group["id"])
+        self.db.set_plan(1, "student")
+        token = self.db.claim_reminder(personal["id"], 1, 3, self.now)
+        self.assertTrue(self.db.begin_reminder_send(personal["id"], 1, 3, self.now, claim_token=token))
+        self.db.mark_reminder_sent(personal["id"], 1, 3, self.now, claim_token=token)
+        publication_token = self.db.begin_publication_send(shared["id"], 2, self.now)
+        self.assertTrue(self.db.finish_publication(shared["id"], 2, token=publication_token, result="disabled"))
+        self.db.close()
+        # Rebuild only the three affected tables with their previous columns;
+        # this fixture works without SQLite's newer DROP COLUMN syntax.
+        with sqlite3.connect(self.path) as legacy:
+            legacy.execute("PRAGMA foreign_keys = OFF")
+            for table in ("users", "reminder_deliveries", "group_publications"):
+                sql = legacy.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+                previous_sql = "\n".join(line for line in sql.splitlines() if "delivery_revision" not in line)
+                columns = ", ".join(row[1] for row in legacy.execute(f"PRAGMA table_info({table})")
+                                    if row[1] != "delivery_revision")
+                legacy.execute(f"CREATE TEMP TABLE previous_rows AS SELECT {columns} FROM {table}")
+                legacy.execute(f"DROP TABLE {table}")
+                legacy.execute(previous_sql)
+                legacy.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM previous_rows")
+                legacy.execute("DROP TABLE previous_rows")
+        self.db = Database(self.path, clock=lambda: self.now)
+        self.assertEqual(self.db.get_user(1)["plan"], "student")
+        self.assertFalse(self.db.get_user(2)["delivery_enabled"])
+        self.assertEqual(self.db.list_group_member_ids(group["id"]), [1, 2])
+        self.assertNotIn(personal["id"], [item["id"] for item in self.db.get_due_reminders(self.now)])
+        self.assertEqual(self.db.get_pending_publications(self.now), [])
+        self.db.set_delivery_enabled(2, True)
+        self.assertEqual([item["id"] for item in self.db.get_pending_publications(self.now)], [shared["id"]])
+        revision = self.db.get_user(2)["delivery_revision"]
+        self.db.initialize()
+        self.db.close()
+        self.db = Database(self.path, clock=lambda: self.now)
+        self.assertEqual(self.db.get_user(2)["delivery_revision"], revision)
+        self.assertEqual(self.db._connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_old_refusal_cannot_disable_recreated_account_or_replacement_claim(self) -> None:
         group = self.db.create_group(2, "ИВТ-32")
         self.db.join_group(1, group["invite_code"])

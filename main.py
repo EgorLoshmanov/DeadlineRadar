@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import math
+import os
 import sqlite3
+import subprocess
 import sys
 import time
 from contextlib import AsyncExitStack
+from datetime import datetime
 from inspect import isawaitable
+from pathlib import Path
 
-from config import Settings, semester_start
+from config import ROOT, Settings, semester_start
 from db import Database
 from notifications import DeliveryDisabled, DeliverySkipped, NotificationService, RetryDelivery
 from models import parse_due_date
@@ -20,6 +26,17 @@ from publications import PublicationService
 from services import DeadlineService
 
 logger = logging.getLogger(__name__)
+
+LLM_CHECK_REASONS = {
+    "timeout": "модель не ответила в пределах установленного времени",
+    "auth": "сервис отклонил ключ или доступ аккаунта",
+    "quota": "сервис отклонил запрос из-за квоты или ограничения частоты",
+    "request": "API отклонил модель или параметры запроса; проверьте LLM_MODEL и LLM_API_URL",
+    "tls": "не удалось проверить сертификат сервера; проверьте LLM_CA_BUNDLE",
+    "network": "не удалось получить ответ сервиса по сети",
+    "response": "ответ модели не прошёл проверку JSON, полей или даты",
+    "busy": "модель уже обрабатывает другой запрос",
+}
 
 
 async def _close_safely(close) -> None:
@@ -47,33 +64,104 @@ def create_parser(settings: Settings) -> ParserEngine:
         settings.llm_api_key, settings.llm_model, settings.llm_timeout, settings.llm_api_url,
         provider=getattr(settings, "llm_provider", "anthropic"),
         ca_bundle=getattr(settings, "llm_ca_bundle", None),
+        chat_template_kwargs=getattr(settings, "llm_chat_template_kwargs", None),
     )
+
+
+async def _probe_llm(settings: Settings, now: datetime | None = None) -> tuple[str | None, float]:
+    """Return only a safe error category and timing, never remote text or credentials."""
+    if not settings.llm_api_key or not settings.llm_model:
+        return "credentials", 0.0
+    parser = create_parser(settings)
+    started = time.monotonic()
+    result = await parser.parse("Лаба 3 по БД до пятницы в 18:00", now=now or settings.now())
+    elapsed = time.monotonic() - started
+    if result["parsing_method"] != "llm":
+        reason = parser.last_remote_error
+        return reason if reason in LLM_CHECK_REASONS else "response", elapsed
+    return None, elapsed
+
+
+def _print_llm_check(settings: Settings, reason: str | None, elapsed: float, *, stopped: bool = False) -> int:
+    if reason == "credentials":
+        print("LLM не подтверждён: заполните LLM_API_KEY и LLM_MODEL в локальном .env.")
+        return 1
+    if reason is not None:
+        detail = LLM_CHECK_REASONS.get(reason, LLM_CHECK_REASONS["response"])
+        status = "Проверка остановлена" if stopped else "Использован локальный разбор"
+        print(f"LLM не подтверждён: {detail}. {status} ({elapsed:.2f} с).")
+        return 1
+    print(f"Проверка LLM пройдена: {settings.llm_provider}; корректный JSON; {elapsed:.2f} с.")
+    return 0
 
 
 async def check_llm(settings: Settings) -> int:
     """Probe the configured model with a public fixture, without Telegram or SQLite."""
+    reason, elapsed = await _probe_llm(settings)
+    return _print_llm_check(settings, reason, elapsed)
+
+
+def _llm_probe_worker() -> None:
+    """Private stdin/stdout protocol used by the bounded CLI process."""
+    values = json.load(sys.stdin)
+    now = datetime.fromisoformat(values.pop("now"))
+    if values.get("llm_ca_bundle") is not None:
+        values["llm_ca_bundle"] = Path(values["llm_ca_bundle"])
+    settings = Settings(**values)
+
+    async def probe() -> None:
+        reason, elapsed = await _probe_llm(settings, now)
+        # Make the safe result available before process-level cleanup.
+        print(json.dumps({"reason": reason, "elapsed": elapsed}), flush=True)
+
+    asyncio.run(probe())
+
+
+def check_llm_bounded(settings: Settings) -> int:
+    """Stop the probe process and its DNS/HTTP threads at the CLI deadline."""
     if not settings.llm_api_key or not settings.llm_model:
-        print("LLM не подтверждён: заполните LLM_API_KEY и LLM_MODEL в локальном .env.")
-        return 1
-    parser = create_parser(settings)
+        return _print_llm_check(settings, "credentials", 0.0)
+    values = {name: getattr(settings, name) for name in (
+        "llm_api_key", "llm_model", "llm_api_url", "llm_timeout", "llm_provider",
+        "llm_chat_template_kwargs", "timezone",
+    )}
+    values["llm_ca_bundle"] = str(settings.llm_ca_bundle) if settings.llm_ca_bundle is not None else None
+    values["now"] = settings.now().isoformat()
+    # Secrets use a private pipe, never command-line arguments. No Telegram token
+    # or database path is passed, and the child never loads .env or opens SQLite.
+    command = [sys.executable, "-c", "from main import _llm_probe_worker; _llm_probe_worker()"]
+    environment = {name: value for name, value in os.environ.items()
+                   if name not in {"BOT_TOKEN", "DATABASE_PATH"} and not name.startswith("LLM_")}
     started = time.monotonic()
-    result = await parser.parse("Лаба 3 по БД до пятницы в 18:00", now=settings.now())
+    process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=environment)
+    timed_out = False
+    try:
+        try:
+            remaining = max(0, settings.llm_timeout - (time.monotonic() - started))
+            output, _ = process.communicate(json.dumps(values), timeout=remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            output, _ = process.communicate()
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
     elapsed = time.monotonic() - started
-    if result["parsing_method"] != "llm":
-        reasons = {
-            "timeout": "модель не ответила в пределах установленного времени",
-            "auth": "сервис отклонил ключ или доступ аккаунта",
-            "quota": "сервис отклонил запрос из-за квоты или ограничения частоты",
-            "tls": "не удалось проверить сертификат сервера; проверьте LLM_CA_BUNDLE",
-            "network": "не удалось получить ответ сервиса по сети",
-            "response": "ответ модели не прошёл проверку JSON, полей или даты",
-            "busy": "модель уже обрабатывает другой запрос",
-        }
-        reason = reasons.get(parser.last_remote_error, "не получен проверенный ответ модели")
-        print(f"LLM не подтверждён: {reason}. Использован локальный разбор ({elapsed:.2f} с).")
-        return 1
-    print(f"Проверка LLM пройдена: {parser.provider}; корректный JSON; {elapsed:.2f} с.")
-    return 0
+    # Never forward arbitrary child output or tracebacks to the user.
+    reason = "timeout" if timed_out else "response"
+    if len(output) <= 4096 and (timed_out or process.returncode == 0):
+        try:
+            value = json.loads(output)
+            if (isinstance(value, dict) and set(value) == {"reason", "elapsed"}
+                    and (value["reason"] is None or value["reason"] in LLM_CHECK_REASONS)
+                    and type(value["elapsed"]) in (int, float)
+                    and math.isfinite(value["elapsed"]) and value["elapsed"] >= 0):
+                reason, elapsed = value["reason"], value["elapsed"]
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            pass
+    return _print_llm_check(settings, reason, elapsed, stopped=timed_out)
 
 
 async def run(settings: Settings) -> None:
@@ -239,7 +327,7 @@ def main() -> int:
         settings = Settings.from_env(require_token=not (args.check or args.check_llm))
         logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         if args.check_llm:
-            return asyncio.run(check_llm(settings))
+            return check_llm_bounded(settings)
         if args.check:
             with Database(settings.database_path, clock=settings.now):
                 pass

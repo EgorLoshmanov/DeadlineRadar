@@ -1,18 +1,19 @@
 """Model routing and isolated CLI checks use a simulated GigaChat transport."""
 
 import asyncio
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import io
 import json
 import ssl
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from config import ROOT, Settings
-from main import check_llm, main
+from main import check_llm, create_parser, main
 from parser import ParserEngine
 
 
@@ -201,6 +202,16 @@ class ModelCheckTests(unittest.IsolatedAsyncioTestCase):
                         llm_provider="gigachat", llm_api_url="https://api.giga.chat/v1/chat/completions",
                         llm_ca_bundle=ROOT / "certs" / "russian_trusted_root_ca.pem", **overrides)
 
+    def test_parser_receives_chat_template_kwargs_and_legacy_settings_remain_supported(self):
+        current = Settings(llm_provider="openai", llm_model="Qwen3.8-27B",
+                           llm_chat_template_kwargs={"enable_thinking": False})
+        legacy = SimpleNamespace(llm_api_key="", llm_model="", llm_timeout=2.5,
+                                 llm_api_url="https://example.org/messages")
+        for settings, expected in ((current, {"enable_thinking": False}), (legacy, None)):
+            with self.subTest(legacy=settings is legacy), patch("main.ParserEngine") as parser:
+                create_parser(settings)
+                self.assertEqual(parser.call_args.kwargs["chat_template_kwargs"], expected)
+
     async def test_empty_key_never_opens_network_telegram_or_database(self):
         settings = Settings(llm_provider="gigachat", llm_model="GigaChat-2")
         output = io.StringIO()
@@ -239,6 +250,33 @@ class ModelCheckTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(main(), 1)
         configuration.assert_called_once_with(require_token=False)
         self.assertIn("LLM не подтверждён", output.getvalue())
+
+    async def test_rejected_model_or_parameters_fail_safely_without_database_or_telegram(self):
+        settings = Settings(llm_provider="openai", llm_api_key="authorization-secret",
+                            llm_model="configured-model", llm_api_url="https://private.example/api/chat/completions")
+        for status in (400, 404, 405, 413, 415, 422):
+            with self.subTest(status=status):
+                output, errors = io.StringIO(), io.StringIO()
+                body = io.BytesIO(b"temporary-secret")
+                error = HTTPError("https://private.example/key?token=query-secret", status,
+                                  "authorization-secret", {"Location": "https://secret-location.example"}, body)
+                with patch("config.datetime") as clock, \
+                        patch("llm.urlopen", side_effect=error) as opener, \
+                        patch("main.Database", side_effect=AssertionError("Unexpected DB access")), \
+                        patch("main.run", side_effect=AssertionError("Unexpected Telegram startup")), \
+                        redirect_stdout(output), redirect_stderr(errors):
+                    clock.now.return_value = NOW
+                    self.assertEqual(await check_llm(settings), 1)
+                self.assertEqual(opener.call_count, 1)
+                self.assertTrue(body.closed)
+                diagnostic = output.getvalue() + errors.getvalue()
+                self.assertIn("LLM не подтверждён", diagnostic)
+                self.assertIn("API отклонил модель или параметры запроса", diagnostic)
+                self.assertIn("LLM_MODEL и LLM_API_URL", diagnostic)
+                self.assertIn("Использован локальный разбор", diagnostic)
+                for secret in ("authorization-secret", "temporary-secret", "private.example",
+                               "query-secret", "secret-location.example"):
+                    self.assertNotIn(secret, diagnostic)
 
 
 if __name__ == "__main__":

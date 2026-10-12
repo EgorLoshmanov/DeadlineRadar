@@ -177,6 +177,53 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.db.get_user(2)["delivery_enabled"])
         self.assertEqual([user for _, user in self.sent], [3])
 
+    async def test_late_forbidden_preserves_new_enable_and_publication_is_retried_once(self):
+        for toggle_off in (False, True):
+            with self.subTest(toggle_off=toggle_off):
+                item = self.publish()
+
+                async def late_refusal(_):
+                    with Database(self.path) as settings_connection:
+                        if toggle_off:
+                            settings_connection.set_delivery_enabled(2, False)
+                        settings_connection.set_delivery_enabled(2, True)
+                    raise DeliveryDisabled
+
+                self.assertEqual(await self.service.tick(late_refusal), 0)
+                self.assertTrue(self.db.get_user(2)["delivery_enabled"])
+                self.assertEqual(await self.service.tick(self.sender), 1)
+                self.assertEqual(await self.service.tick(self.sender), 0)
+                self.assertEqual(self.sent[-1], (item["id"], 2))
+        self.assertEqual(len(self.sent), 2)
+
+    async def test_publication_send_gate_uses_setting_after_preparation(self):
+        self.publish()
+
+        async def reenable(_):
+            self.db.set_delivery_enabled(2, True)
+
+        async def refused(_):
+            raise DeliveryDisabled
+
+        self.assertEqual(await self.service.tick(refused, prepare=reenable), 0)
+        self.assertFalse(self.db.get_user(2)["delivery_enabled"])
+        self.db.set_delivery_enabled(2, True)
+        self.assertEqual(await self.service.tick(self.sender), 1)
+        self.assertEqual(await self.service.tick(self.sender), 0)
+
+    async def test_explicit_enable_recovers_only_confirmed_disabled_publications(self):
+        items = {status: self.publish() for status in ("sent", "uncertain", "sending", "disabled")}
+        for status, item in items.items():
+            token = self.db.begin_publication_send(item["id"], 2, self.now)
+            self.assertIsNotNone(token)
+            if status != "sending":
+                self.db.finish_publication(item["id"], 2, token=token, result=status)
+        self.assertFalse(self.db.get_user(2)["delivery_enabled"])
+        self.db.set_delivery_enabled(2, True)
+        self.assertEqual(await self.service.tick(self.sender), 1)
+        self.assertEqual(self.sent, [(items["disabled"]["id"], 2)])
+        self.assertEqual(await self.service.tick(self.sender), 0)
+
     async def test_stale_refusal_does_not_disable_recreated_account(self):
         item = self.publish()
         token = self.db.begin_publication_send(item["id"], 2, self.now)

@@ -82,7 +82,7 @@ class GigaChatClientTests(unittest.TestCase):
         self.assertFalse(body["stream"])
         for call in opener.call_args_list:
             self.assertGreater(call.kwargs["timeout"], 0)
-            self.assertLessEqual(call.kwargs["timeout"], 2.5)
+            self.assertLessEqual(call.kwargs["timeout"], 5.0)
             self.assertIs(call.kwargs["context"], self.context)
 
     def test_cached_token_skips_second_oauth_request(self):
@@ -159,6 +159,18 @@ class GigaChatClientTests(unittest.TestCase):
                 self.assertNotIn("authorization-key", str(raised.exception))
                 self.assertNotIn("message", str(raised.exception))
 
+    def test_wrapped_socket_timeouts_remain_timeouts_at_both_request_stages(self):
+        for stage in ("oauth", "chat"):
+            with self.subTest(stage=stage):
+                error = URLError(TimeoutError("authorization-key and message"))
+                responses = [oauth(), error] if stage == "chat" else [error]
+                with patch("llm.urlopen", side_effect=responses) as opener:
+                    with self.assertRaises(TimeoutError) as raised:
+                        GigaChatClient("authorization-key").request("system", "message")
+                self.assertEqual(opener.call_count, len(responses))
+                self.assertNotIn("authorization-key", str(raised.exception))
+                self.assertNotIn("message", str(raised.exception))
+
     def test_malformed_choices_and_model_json_are_rejected(self):
         for value in (
             {}, {"choices": []}, {"choices": {}}, {"choices": [None]},
@@ -197,8 +209,8 @@ class GigaChatClientTests(unittest.TestCase):
     def test_one_budget_is_shared_between_oauth_and_generation(self):
         def response(request, **kwargs):
             if request.full_url == OAUTH_URL:
-                self.assertAlmostEqual(kwargs["timeout"], 2.5)
-                self.monotonic_value += 1.75
+                self.assertAlmostEqual(kwargs["timeout"], 5.0)
+                self.monotonic_value += 4.25
                 return oauth()
             self.assertAlmostEqual(kwargs["timeout"], 0.75)
             return chat()
@@ -209,7 +221,7 @@ class GigaChatClientTests(unittest.TestCase):
 
     def test_expired_budget_after_oauth_prevents_late_generation(self):
         def late_token(*_, **kwargs):
-            self.monotonic_value += 2.6
+            self.monotonic_value += 5.1
             return oauth()
 
         with patch("llm.urlopen", side_effect=late_token) as opener:
@@ -225,7 +237,7 @@ class GigaChatClientTests(unittest.TestCase):
         self.context_factory.assert_not_called()
 
     def test_external_deadline_can_shorten_but_not_extend_own_budget(self):
-        for deadline, expected in ((100.25, 0.25), (200.0, 2.5)):
+        for deadline, expected in ((100.25, 0.25), (200.0, 5.0)):
             with self.subTest(deadline=deadline):
                 client = GigaChatClient("key")
                 with patch("llm.urlopen", side_effect=[oauth(), chat()]) as opener:
@@ -234,7 +246,7 @@ class GigaChatClientTests(unittest.TestCase):
 
     def test_tls_initialization_consumes_the_same_budget(self):
         def slow_context():
-            self.monotonic_value += 2.6
+            self.monotonic_value += 5.1
             return self.context
 
         self.context_factory.side_effect = slow_context
@@ -303,7 +315,7 @@ class GigaChatClientTests(unittest.TestCase):
             with self.subTest(key=repr(key)), self.assertRaises(ValueError) as raised:
                 GigaChatClient(key)
             self.assertNotIn("secret", str(raised.exception))
-        self.assertEqual(GigaChatClient("key", timeout=10).timeout, 2.5)
+        self.assertEqual(GigaChatClient("key", timeout=10).timeout, 5.0)
 
 
 if __name__ == "__main__":

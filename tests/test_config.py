@@ -89,6 +89,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.llm_provider, "anthropic")
         self.assertEqual(value.llm_api_url, "https://api.anthropic.com/v1/messages")
         self.assertIsNone(value.llm_ca_bundle)
+        self.assertIsNone(value.llm_chat_template_kwargs)
 
     def test_relative_database_is_resolved_from_project_root(self):
         os.environ["DATABASE_PATH"] = "data/students.db"
@@ -121,6 +122,30 @@ class SettingsTests(unittest.TestCase):
         os.environ["APP_TIMEZONE"] = "Unknown/NoSuchCity"
         with self.assertRaisesRegex(ValueError, "APP_TIMEZONE"):
             self.settings()
+
+    def test_malformed_https_endpoints_fail_configuration_for_every_provider(self):
+        endpoints = (
+            "https://", "https:///messages", "https://:443/messages", "https://[broken/messages",
+            "https://example.org:bad/messages", "https://example.org:65536/messages",
+            "https://example.org:0/messages", "https://exa mple.org/messages",
+            "https://example.org/path with space", "https://exam\nple.org/messages",
+            "https://user:fixture-password@example.org/messages", "https://@example.org/messages",
+        )
+        for provider in ("anthropic", "gigachat", "openai"):
+            os.environ["LLM_PROVIDER"] = provider
+            for endpoint in endpoints:
+                with self.subTest(provider=provider, endpoint=endpoint):
+                    os.environ["LLM_API_URL"] = endpoint
+                    with self.assertRaisesRegex(ValueError, "LLM_API_URL") as raised:
+                        self.settings()
+                    self.assertNotIn("fixture-password", str(raised.exception))
+
+    def test_valid_custom_https_endpoints_keep_ports_queries_and_ipv6(self):
+        for endpoint in ("https://example.org:8443/api/messages?version=2",
+                         "https://[::1]:9443/custom/messages", "https://example.org/path%20encoded"):
+            with self.subTest(endpoint=endpoint):
+                os.environ["LLM_API_URL"] = f" {endpoint} "
+                self.assertEqual(self.settings().llm_api_url, endpoint)
 
     def test_now_is_naive_in_configured_application_timezone(self):
         os.environ["APP_TIMEZONE"] = "Asia/Novosibirsk"
@@ -179,8 +204,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.llm_api_key, "")
 
     def test_provider_is_normalized_and_unknown_values_are_rejected(self):
-        os.environ["LLM_PROVIDER"] = " GigaChat "
-        self.assertEqual(self.settings().llm_provider, "gigachat")
+        for value, expected in ((" GigaChat ", "gigachat"), (" OpenAI ", "openai"),
+                                (" Anthropic ", "anthropic")):
+            with self.subTest(value=value):
+                os.environ["LLM_PROVIDER"] = value
+                self.assertEqual(self.settings().llm_provider, expected)
         for value in ("", "other", "claude"):
             with self.subTest(value=value):
                 os.environ["LLM_PROVIDER"] = value
@@ -198,9 +226,95 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.llm_api_key, "authorization-key")
 
     def test_explicit_empty_model_is_preserved(self):
-        os.environ.update(LLM_PROVIDER="gigachat", LLM_MODEL="", LLM_API_KEY="")
-        self.assertEqual(self.settings().llm_model, "")
-        self.assertEqual(self.settings().llm_api_key, "")
+        for provider in ("gigachat", "anthropic", "openai"):
+            with self.subTest(provider=provider):
+                os.environ.update(LLM_PROVIDER=provider, LLM_MODEL="", LLM_API_KEY="")
+                self.assertEqual(self.settings().llm_model, "")
+                self.assertEqual(self.settings().llm_api_key, "")
+
+    def test_openai_defaults_supply_nsu_model_and_endpoint_without_requiring_key(self):
+        os.environ["LLM_PROVIDER"] = "openai"
+        value = self.settings()
+        self.assertEqual(value.llm_provider, "openai")
+        self.assertEqual(value.llm_model, "Qwen3.8-27B")
+        self.assertEqual(value.llm_api_url, "https://deepcode.ci.nsu.ru/api/chat/completions")
+        self.assertEqual(value.llm_api_key, "")
+        self.assertIsNone(value.llm_ca_bundle)
+        self.assertEqual(value.llm_timeout, 5.0)
+
+    def test_chat_template_kwargs_are_optional_and_blank_values_disable_them(self):
+        for raw in ("", "  \t "):
+            with self.subTest(raw=raw):
+                os.environ["LLM_CHAT_TEMPLATE_KWARGS"] = raw
+                self.assertIsNone(self.settings().llm_chat_template_kwargs)
+
+    def test_chat_template_kwargs_preserve_only_supported_boolean_values(self):
+        for raw, expected in (
+            ('{"enable_thinking": false}', {"enable_thinking": False}),
+            (' {"thinking": true} ', {"thinking": True}),
+            ('{"thinking": false, "enable_thinking": true}', {"thinking": False, "enable_thinking": True}),
+            ("{}", {}),
+        ):
+            with self.subTest(raw=raw):
+                os.environ["LLM_CHAT_TEMPLATE_KWARGS"] = raw
+                self.assertEqual(self.settings().llm_chat_template_kwargs, expected)
+
+    def test_invalid_chat_template_kwargs_never_reveal_the_configured_value(self):
+        expected = "LLM_CHAT_TEMPLATE_KWARGS должен быть JSON-объектом с ключами thinking/enable_thinking и логическими значениями"
+        for raw in (
+            "private-config-secret", '{"thinking":false,', "[]", "null", "true", "42",
+            '"private-config-secret"', '{"private-config-secret":false}', '{"thinking":0}',
+            '{"thinking":1}', '{"thinking":"private-config-secret"}', '{"thinking":null}',
+            '{"enable_thinking":[]}', '{"thinking":false,"extra":"private-config-secret"}',
+            '{"thinking":NaN}',
+        ):
+            with self.subTest(raw=raw):
+                os.environ["LLM_CHAT_TEMPLATE_KWARGS"] = raw
+                with self.assertRaises(ValueError) as raised:
+                    self.settings()
+                self.assertEqual(str(raised.exception), expected)
+                self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_chat_template_kwargs_load_from_file_and_process_values_take_priority(self):
+        self.env_file.write_text(
+            'LLM_PROVIDER=openai\nLLM_CHAT_TEMPLATE_KWARGS=\'{"enable_thinking":false}\'\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.settings().llm_chat_template_kwargs, {"enable_thinking": False})
+        os.environ["LLM_CHAT_TEMPLATE_KWARGS"] = '{"thinking":true}'
+        self.assertEqual(self.settings().llm_chat_template_kwargs, {"thinking": True})
+        os.environ["LLM_CHAT_TEMPLATE_KWARGS"] = ""
+        self.assertIsNone(self.settings().llm_chat_template_kwargs)
+
+    def test_openai_accepts_explicit_model_endpoint_and_api_key(self):
+        os.environ.update(
+            LLM_PROVIDER="openai", LLM_MODEL=" Qwen3.8-27B ",
+            LLM_API_URL=" https://example.org/v1/chat/completions ", LLM_API_KEY=" example-key ",
+        )
+        value = self.settings()
+        self.assertEqual(value.llm_model, "Qwen3.8-27B")
+        self.assertEqual(value.llm_api_url, "https://example.org/v1/chat/completions")
+        self.assertEqual(value.llm_api_key, "example-key")
+
+    def test_openai_keeps_process_overrides_and_explicit_empty_credentials(self):
+        self.env_file.write_text(
+            "LLM_PROVIDER=openai\nLLM_MODEL=file-model\nLLM_API_KEY=file-key\nLLM_TIMEOUT=5\n",
+            encoding="utf-8",
+        )
+        os.environ.update(LLM_MODEL="Qwen3.8-27B", LLM_API_KEY="")
+        value = self.settings()
+        self.assertEqual(value.llm_provider, "openai")
+        self.assertEqual(value.llm_model, "Qwen3.8-27B")
+        self.assertEqual(value.llm_api_key, "")
+        self.assertEqual(value.llm_timeout, 5.0)
+
+    def test_openai_rejects_insecure_or_empty_endpoint(self):
+        os.environ["LLM_PROVIDER"] = "openai"
+        for endpoint in ("http://example.org/chat/completions", "", "file:///tmp/response"):
+            with self.subTest(endpoint=endpoint):
+                os.environ["LLM_API_URL"] = endpoint
+                with self.assertRaisesRegex(ValueError, "HTTPS"):
+                    self.settings()
 
     def test_legacy_anthropic_configuration_keeps_provider_and_custom_model(self):
         self.env_file.write_text("LLM_MODEL=existing-model\nLLM_API_URL=https://example.org/messages\n", encoding="utf-8")
@@ -209,11 +323,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.llm_model, "existing-model")
         self.assertEqual(value.llm_api_url, "https://example.org/messages")
 
-    def test_legacy_timeout_values_are_capped_to_one_request_budget(self):
+    def test_timeout_values_up_to_five_seconds_are_preserved(self):
         for value in ("2.5", "3", "4.5", "5"):
             with self.subTest(value=value):
                 os.environ["LLM_TIMEOUT"] = value
-                self.assertEqual(self.settings().llm_timeout, 2.5)
+                self.assertEqual(self.settings().llm_timeout, float(value))
         os.environ["LLM_TIMEOUT"] = "1.25"
         self.assertEqual(self.settings().llm_timeout, 1.25)
 
@@ -249,6 +363,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.log_level, "DEBUG")
         self.assertEqual(value.llm_provider, "anthropic")
         self.assertIsNone(value.llm_ca_bundle)
+        self.assertIsNone(value.llm_chat_template_kwargs)
 
 
 class SemesterTests(unittest.TestCase):

@@ -76,6 +76,7 @@ class Database:
                     username TEXT,
                     delivery_enabled INTEGER NOT NULL DEFAULT 1
                         CHECK (delivery_enabled IN (0, 1)),
+                    delivery_revision INTEGER NOT NULL DEFAULT 0 CHECK (delivery_revision >= 0),
                     plan TEXT NOT NULL DEFAULT 'free'
                         CHECK (plan IN ('free', 'student', 'group')),
                     created_at TEXT NOT NULL
@@ -120,6 +121,7 @@ class Database:
                     sent_at TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
                     claim_token TEXT,
+                    delivery_revision INTEGER NOT NULL DEFAULT 0 CHECK (delivery_revision >= 0),
                     PRIMARY KEY (deadline_id, user_id, days_before)
                 );
                 CREATE TABLE IF NOT EXISTS reminder_attempts (
@@ -140,6 +142,7 @@ class Database:
                     claim_token TEXT,
                     attempted_at TEXT,
                     finished_at TEXT,
+                    delivery_revision INTEGER NOT NULL DEFAULT 0 CHECK (delivery_revision >= 0),
                     PRIMARY KEY (deadline_id, user_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_publications_pending ON group_publications(status, retry_at);
@@ -181,6 +184,13 @@ class Database:
                         """ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'
                            CHECK (plan IN ('free', 'student', 'group'))"""
                     )
+                for table in ("users", "reminder_deliveries", "group_publications"):
+                    columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+                    if not any(column["name"] == "delivery_revision" for column in columns):
+                        connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN delivery_revision INTEGER NOT NULL DEFAULT 0 "
+                            "CHECK (delivery_revision >= 0)"
+                        )
                 delivery_columns = connection.execute("PRAGMA table_info(reminder_deliveries)").fetchall()
                 if not any(column["name"] == "claim_token" for column in delivery_columns):
                     connection.execute("ALTER TABLE reminder_deliveries ADD COLUMN claim_token TEXT")
@@ -248,7 +258,19 @@ class Database:
     def set_delivery_enabled(self, user_id: int, enabled: bool) -> None:
         with self._transaction() as connection:
             self._ensure_user(connection, user_id)
-            connection.execute("UPDATE users SET delivery_enabled = ? WHERE id = ?", (bool(enabled), user_id))
+            # Even a repeated explicit enable supersedes an older in-flight refusal.
+            connection.execute(
+                """UPDATE users SET delivery_enabled = ?, delivery_revision = delivery_revision + 1
+                   WHERE id = ?""", (bool(enabled), user_id),
+            )
+            if enabled:
+                # A confirmed Forbidden response did not deliver the message.
+                # Re-enabling may recover it, but never replay sent/uncertain work.
+                connection.execute(
+                    """UPDATE group_publications SET status = 'pending', claim_token = NULL,
+                              retry_at = NULL, finished_at = NULL
+                       WHERE user_id = ? AND status = 'disabled'""", (user_id,),
+                )
 
     @staticmethod
     def _plan_usage(connection: sqlite3.Connection, user_id: int) -> dict:
@@ -290,10 +312,12 @@ class Database:
         """Apply a transport refusal only while its original reservation still exists."""
         with self._transaction() as connection:
             return connection.execute(
-                """UPDATE users SET delivery_enabled = 0 WHERE id = ?
-                   AND EXISTS (SELECT 1 FROM reminder_deliveries
-                       WHERE deadline_id = ? AND user_id = ? AND days_before = ?
-                         AND status = 'claimed' AND claim_token = ?)""",
+                """UPDATE users SET delivery_enabled = 0, delivery_revision = delivery_revision + 1
+                   WHERE id = ? AND EXISTS (
+                       SELECT 1 FROM reminder_deliveries rd
+                       WHERE rd.deadline_id = ? AND rd.user_id = ? AND rd.days_before = ?
+                         AND rd.status = 'claimed' AND rd.claim_token = ?
+                         AND rd.delivery_revision = users.delivery_revision)""",
                 (user_id, deadline_id, user_id, days_before, claim_token),
             ).rowcount > 0
 
@@ -510,9 +534,10 @@ class Database:
                 return None
             token = secrets.token_hex(16)
             connection.execute(
-                """UPDATE group_publications SET status = 'sending', claim_token = ?, attempted_at = ?
+                """UPDATE group_publications SET status = 'sending', claim_token = ?, attempted_at = ?,
+                          delivery_revision = (SELECT delivery_revision FROM users WHERE id = ?)
                    WHERE deadline_id = ? AND user_id = ? AND status = 'pending'""",
-                (token, _stamp(now), deadline_id, user_id),
+                (token, _stamp(now), user_id, deadline_id, user_id),
             )
             return token
 
@@ -526,7 +551,23 @@ class Database:
                 (result, _stamp(self.clock()), deadline_id, user_id, token),
             ).rowcount > 0
             if updated and result == "disabled":
-                connection.execute("UPDATE users SET delivery_enabled = 0 WHERE id = ?", (user_id,))
+                disabled = connection.execute(
+                    """UPDATE users SET delivery_enabled = 0, delivery_revision = delivery_revision + 1
+                       WHERE id = ? AND delivery_revision = (
+                           SELECT delivery_revision FROM group_publications
+                           WHERE deadline_id = ? AND user_id = ? AND claim_token = ?)""",
+                    (user_id, deadline_id, user_id, token),
+                ).rowcount > 0
+                if not disabled:
+                    # A newer explicit enable supersedes this old refusal. It is
+                    # safe to retry because Forbidden confirms no delivery.
+                    connection.execute(
+                        """UPDATE group_publications SET status = 'pending', claim_token = NULL,
+                                  retry_at = NULL, finished_at = NULL
+                           WHERE deadline_id = ? AND user_id = ? AND claim_token = ?
+                             AND EXISTS (SELECT 1 FROM users WHERE id = ? AND delivery_enabled = 1)""",
+                        (deadline_id, user_id, token, user_id),
+                    )
             return updated
 
     def retry_publication(self, deadline_id: int, user_id: int, *, token: str, retry_at: datetime) -> bool:
@@ -630,14 +671,15 @@ class Database:
             claim_token = secrets.token_hex(16)
             connection.execute(
                 """INSERT INTO reminder_deliveries
-                   (deadline_id, user_id, days_before, status, lease_until, attempts, claim_token)
-                   VALUES (?, ?, ?, 'claimed', ?, 1, ?)
+                   (deadline_id, user_id, days_before, status, lease_until, attempts, claim_token, delivery_revision)
+                   VALUES (?, ?, ?, 'claimed', ?, 1, ?,
+                           (SELECT delivery_revision FROM users WHERE id = ?))
                    ON CONFLICT(deadline_id, user_id, days_before) DO UPDATE SET
                        status = 'claimed', lease_until = excluded.lease_until,
                        next_attempt_at = NULL, attempts = reminder_deliveries.attempts + 1,
-                       claim_token = excluded.claim_token""",
+                       claim_token = excluded.claim_token, delivery_revision = excluded.delivery_revision""",
                 (deadline_id, user_id, days_before,
-                 _stamp(now + timedelta(seconds=REMINDER_LEASE_SECONDS)), claim_token),
+                 _stamp(now + timedelta(seconds=REMINDER_LEASE_SECONDS)), claim_token, user_id),
             )
             return claim_token
 
@@ -657,6 +699,12 @@ class Database:
                 days_before=days_before, ignore_claim=True,
             ):
                 return False
+            connection.execute(
+                """UPDATE reminder_deliveries SET delivery_revision = (
+                       SELECT delivery_revision FROM users WHERE id = ?)
+                   WHERE deadline_id = ? AND user_id = ? AND days_before = ? AND claim_token = ?""",
+                (user_id, deadline_id, user_id, days_before, claim_token),
+            )
             connection.execute(
                 """INSERT INTO reminder_attempts
                    (deadline_id, user_id, days_before, claim_token, attempted_at, result)

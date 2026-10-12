@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from db import Database
 from parser import ParserEngine
@@ -352,6 +353,34 @@ class BotConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.state().get_state())
         self.assertEqual(self.db.list_deadlines(1), [])
 
+    async def test_out_of_range_callback_ids_do_not_raise_or_change_data(self) -> None:
+        item = self.db.create_deadline(1, "Физика", "Лабораторная", self.now + timedelta(days=2))
+        preview = await self.preview()
+        state_before = deepcopy(await self.state().get_data())
+        for value in ("0", "-1", str(2**63), "9" * 30):
+            for prefix in ("done:", "remove:ask:", "remove:yes:", "publish:", "invite:", "leave:ask:", "leave:yes:"):
+                with self.subTest(prefix=prefix, value=value):
+                    callback = prefix + value
+                    self.assertLessEqual(len(callback.encode("utf-8")), 64)
+                    with self.assertNoLogs("bot", level="ERROR"):
+                        answer = await self.click(callback, message=preview)
+                    self.assertNotIn("Не удалось выполнить действие", answer.text)
+                    self.assertEqual(await self.state().get_state(), Flow.preview.state)
+                    self.assertEqual(await self.state().get_data(), state_before)
+                    self.assertEqual(len(self.db.list_deadlines(1)), 1)
+                    self.assertFalse(self.db.get_deadline(1, item["id"])["completed"])
+
+    async def test_largest_sqlite_id_can_still_be_completed(self) -> None:
+        item = self.db.create_deadline(1, "Физика", "Лабораторная", self.now + timedelta(days=2))
+        maximum_id = 2**63 - 1
+        with self.db._transaction() as connection:
+            connection.execute("UPDATE deadlines SET id = ? WHERE id = ?", (maximum_id, item["id"]))
+        listing = await self.send("/deadlines")
+        with self.assertNoLogs("bot", level="ERROR"):
+            answer = await self.click(self.button(listing, "done:"), message=listing)
+        self.assertIn("Отмечено", answer.text)
+        self.assertTrue(self.db.get_deadline(1, maximum_id)["completed"])
+
     async def test_group_owner_publishes_but_member_cannot_use_owner_callback(self) -> None:
         group = await self.shared_group()
         rejected = await self.click(f"publish:{group['id']}", user_id=2)
@@ -432,6 +461,40 @@ class BotConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.click(self.button(confirmation, "remove:yes:"), message=confirmation)
         self.assertIsNone(self.db.get_deadline(1, item["id"]))
         self.assertIsNone(self.db.get_deadline(2, item["id"]))
+
+    async def test_owner_can_delete_shared_deadline_after_own_completion(self) -> None:
+        group = await self.shared_group()
+        item = self.db.create_deadline(
+            1, "Физика", "Лабораторная", self.now + timedelta(days=2), group_id=group["id"],
+        )
+        listing = await self.send("/deadlines")
+        await self.click(self.button(listing, "done:"), message=listing)
+        self.assertEqual(self.db.list_deadlines(1), [])
+        self.assertFalse(self.db.get_deadline(2, item["id"])["completed"])
+
+        history = await self.send("/history")
+        self.assertIn("Лабораторная", history.text)
+        await self.click(self.button(history, "remove:ask:"), message=history)
+        confirmation = self.session.last_message()
+        self.assertIn("у всех участников", confirmation.text)
+        self.assertIsNotNone(self.db.get_deadline(2, item["id"]))
+        await self.click(self.button(confirmation, "remove:yes:"), message=confirmation)
+        self.assertIsNone(self.db.get_deadline(1, item["id"]))
+        self.assertIsNone(self.db.get_deadline(2, item["id"]))
+
+    async def test_completed_group_history_keeps_member_delete_restricted(self) -> None:
+        group = await self.shared_group()
+        item = self.db.create_deadline(
+            1, "Физика", "Лабораторная", self.now + timedelta(days=2), group_id=group["id"],
+        )
+        listing = await self.send("/deadlines", user_id=2)
+        await self.click(self.button(listing, "done:"), user_id=2, message=listing)
+        history = await self.send("/history", user_id=2)
+        callbacks = [button.callback_data for row in history.reply_markup.inline_keyboard for button in row]
+        self.assertFalse(any(data.startswith(("remove:", "done:")) for data in callbacks))
+        rejected = await self.click(f"remove:yes:{item['id']}", user_id=2, message=history)
+        self.assertTrue(rejected.show_alert)
+        self.assertIsNotNone(self.db.get_deadline(1, item["id"]))
 
     async def test_group_chat_content_is_not_parsed_or_persisted(self) -> None:
         group_reply = await self.send("Лаба 3 по БД до 15.10.2026", chat_id=-100123)
@@ -519,30 +582,34 @@ class BotConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_settings_names_configured_provider_and_preserves_legacy_default(self) -> None:
         self.settings.llm_api_key = "offline-test-key"
         self.settings.llm_model = "offline-test-model"
-        for provider, expected, excluded in (
-            ("gigachat", "GigaChat", "Anthropic"),
-            ("anthropic", "Anthropic", "GigaChat"),
-            (None, "Anthropic", "GigaChat"),
+        for provider, api_url, expected, excluded in (
+            ("gigachat", "https://api.giga.chat/v1/chat/completions", "GigaChat", "Anthropic"),
+            ("anthropic", "https://api.anthropic.com/v1/messages", "Anthropic", "GigaChat"),
+            ("openai", "https://deepcode.ci.nsu.ru/api/chat/completions", "API НГУ", "Anthropic"),
+            ("openai", "https://other.example/v1/chat/completions", "совместимый API", "API НГУ"),
+            (None, "https://api.anthropic.com/v1/messages", "Anthropic", "GigaChat"),
         ):
-            with self.subTest(provider=provider):
+            with self.subTest(provider=provider, api_url=api_url):
                 if provider is None:
                     del self.settings.llm_provider
                 else:
                     self.settings.llm_provider = provider
+                self.settings.llm_api_url = api_url
                 message = await self.send("/settings")
                 self.assertIn(f"отправляется провайдеру {expected}", message.text)
                 self.assertNotIn(excluded, message.text)
                 self.assertNotIn("Распознавание выполняется локально", message.text)
 
     async def test_settings_describes_local_parsing_when_key_or_model_is_empty(self) -> None:
-        self.settings.llm_provider = "gigachat"
-        for key, model in (("", "offline-test-model"), ("offline-test-key", "")):
-            with self.subTest(key_present=bool(key), model_present=bool(model)):
-                self.settings.llm_api_key = key
-                self.settings.llm_model = model
-                message = await self.send("/settings")
-                self.assertIn("Распознавание выполняется локально", message.text)
-                self.assertNotIn("отправляется провайдеру", message.text)
+        for provider in ("gigachat", "openai"):
+            self.settings.llm_provider = provider
+            for key, model in (("", "offline-test-model"), ("offline-test-key", "")):
+                with self.subTest(provider=provider, key_present=bool(key), model_present=bool(model)):
+                    self.settings.llm_api_key = key
+                    self.settings.llm_model = model
+                    message = await self.send("/settings")
+                    self.assertIn("Распознавание выполняется локально", message.text)
+                    self.assertNotIn("отправляется провайдеру", message.text)
 
     async def test_start_deep_link_joins_group_without_enabling_paused_delivery(self) -> None:
         group = self.db.create_group(2, "ИВТ-32")
@@ -554,6 +621,58 @@ class BotConversationTests(unittest.IsolatedAsyncioTestCase):
         settings = await self.send("/settings")
         await self.click(self.button(settings, "settings:delivery:1"), message=settings)
         self.assertTrue(self.db.get_user(1)["delivery_enabled"])
+
+    async def test_join_command_preserves_entire_generated_invite_code(self) -> None:
+        for user_id, code in enumerate(("plaincode123", "g_1234567890", "g_g_12345678"), 2):
+            with self.subTest(code=code):
+                with patch("db.secrets.token_urlsafe", return_value=code):
+                    invitation = await self.send("/newgroup ИВТ-31")
+                group = next(group for group in self.db.list_groups(1) if group["invite_code"] == code)
+                self.assertIn(f"/join {code}", invitation.text)
+                response = await self.send(f"/join {code}", user_id)
+                self.assertIn("Вы в группе", response.text)
+                self.assertEqual([entry["id"] for entry in self.db.list_groups(user_id)], [group["id"]])
+
+    async def test_join_prompt_preserves_raw_codes_with_start_prefix(self) -> None:
+        for user_id, code in enumerate(("g_1234567890", "g_g_12345678"), 2):
+            with self.subTest(code=code):
+                with patch("db.secrets.token_urlsafe", return_value=code):
+                    group = self.db.create_group(1, "ИВТ-31")
+                await self.send("/start", user_id)
+                await self.click("group:join", user_id)
+                response = await self.send(code, user_id)
+                self.assertIn("Вы в группе", response.text)
+                self.assertEqual(self.db.list_groups(user_id)[0]["id"], group["id"])
+                self.assertIsNone(await self.state(user_id).get_state())
+
+    async def test_group_links_strip_only_the_added_start_wrapper(self) -> None:
+        user_id = 2
+        for code in ("plaincode123", "g_1234567890", "g_g_12345678"):
+            with patch("db.secrets.token_urlsafe", return_value=code):
+                group = self.db.create_group(1, "ИВТ-31")
+            link = f"https://t.me/deadline_radar_test_bot?start=g_{code}"
+            for entry in ("start", "join_url", "prompt_url"):
+                with self.subTest(code=code, entry=entry):
+                    if entry == "start":
+                        response = await self.send(f"/start g_{code}", user_id)
+                    elif entry == "join_url":
+                        response = await self.send(f"/join {link}", user_id)
+                    else:
+                        await self.send("/start", user_id)
+                        await self.click("group:join", user_id)
+                        response = await self.send(link, user_id)
+                    self.assertIn("Вы в группе", response.text)
+                    self.assertEqual(self.db.list_groups(user_id)[0]["id"], group["id"])
+                    user_id += 1
+
+    async def test_join_command_still_accepts_a_bare_start_payload(self) -> None:
+        for user_id, code in enumerate(("plaincode123", "g_1234567890", "g_g_12345678"), 2):
+            with self.subTest(code=code):
+                with patch("db.secrets.token_urlsafe", return_value=code):
+                    group = self.db.create_group(1, "ИВТ-31")
+                response = await self.send(f"/join g_{code}", user_id)
+                self.assertIn("Вы в группе", response.text)
+                self.assertEqual(self.db.list_groups(user_id)[0]["id"], group["id"])
 
 
 if __name__ == "__main__":

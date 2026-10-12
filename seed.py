@@ -17,8 +17,8 @@ def positive_user_id(value: str) -> int:
         result = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("Telegram ID должен быть целым числом") from exc
-    if result <= 0:
-        raise argparse.ArgumentTypeError("Telegram ID должен быть положительным")
+    if not 1 <= result <= 2**63 - 1:
+        raise argparse.ArgumentTypeError("Telegram ID должен быть от 1 до 9223372036854775807")
     return result
 
 

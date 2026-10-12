@@ -96,6 +96,42 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.service.tick(sender), 0)
         self.assertEqual(attempts, [1, 2])
 
+    async def test_late_forbidden_does_not_override_newer_explicit_enable(self) -> None:
+        for user_id, toggle_off in ((1, False), (2, True)):
+            with self.subTest(toggle_off=toggle_off):
+                deadline = self.deadline(user_id)
+
+                async def late_refusal(item):
+                    with Database(self.path) as settings_connection:
+                        if toggle_off:
+                            settings_connection.set_delivery_enabled(item["user_id"], False)
+                        settings_connection.set_delivery_enabled(item["user_id"], True)
+                    raise DeliveryDisabled
+
+                self.assertEqual(await self.service.tick(late_refusal), 0)
+                self.assertTrue(self.db.get_user(user_id)["delivery_enabled"])
+                sent = []
+
+                async def sender(item):
+                    sent.append(item["id"])
+
+                self.assertEqual(await self.service.tick(sender), 1)
+                self.assertEqual(await self.service.tick(sender), 0)
+                self.assertEqual(sent, [deadline["id"]])
+
+    async def test_reminder_send_gate_uses_setting_after_preparation(self) -> None:
+        self.deadline()
+
+        async def reenable(_):
+            self.db.set_delivery_enabled(1, True)
+
+        async def refused(_):
+            raise DeliveryDisabled
+
+        self.assertEqual(await self.service.tick(refused, prepare=reenable), 0)
+        # This refusal belongs to the new setting: it must still pause delivery.
+        self.assertFalse(self.db.get_user(1)["delivery_enabled"])
+
     async def test_explicit_retry_delay_is_respected(self) -> None:
         self.deadline()
         attempts = []

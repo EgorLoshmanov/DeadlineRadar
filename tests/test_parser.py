@@ -113,6 +113,98 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expression=expression):
                 await self.check_date("Лаба по БД " + expression, expected)
 
+    async def test_relative_days_do_not_drop_long_or_malformed_offsets(self):
+        due = (NOW + timedelta(days=1000)).replace(hour=23, minute=59).strftime("%Y-%m-%d %H:%M")
+        await self.check_date("Лаба по БД через 1000 дней", due)
+        for expression in ("через 1000 дней завтра", "через 999999999999999999 дней",
+                           "через 1.5 дня завтра", "через 1,5 дня завтра", "через два дня завтра"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба по БД " + expression, None)
+
+    async def test_relative_hours_and_minutes_use_the_supplied_now(self):
+        for expression, due in (
+            ("через 5 часов", "2026-10-11 15:30"),
+            ("через 1 час", "2026-10-11 11:30"),
+            ("через 30 минут", "2026-10-11 11:00"),
+            ("через 1 минуту", "2026-10-11 10:31"),
+            ("через 90 минут", "2026-10-11 12:00"),
+            ("через 2 часа 15 минут", "2026-10-11 12:45"),
+            ("через 2 часа и 15 минут", "2026-10-11 12:45"),
+            ("через 2ч15мин", "2026-10-11 12:45"),
+            ("через 0 часов 30 минут", "2026-10-11 11:00"),
+        ):
+            with self.subTest(expression=expression):
+                value = await self.check_date("Лаба 3 по БД " + expression, due)
+                self.assertEqual(value["task"], "Лабораторная работа №3")
+
+    async def test_relative_deadlines_preserve_python_subject_without_assignment_numbers(self):
+        for subject in ("Python", "python", "Питон", "Питону", "Питоне"):
+            with self.subTest(subject=subject):
+                text = f"Через 5 часов нужно скинуть код по {subject}"
+                value = await self.check_date(text, "2026-10-11 15:30")
+                self.assertEqual(value["subject"], "Python")
+                _, content = self.parser._messages(text, NOW)
+                context = json.loads(content)
+                self.assertEqual(context["verified_due_date"], value["due_date"])
+                self.assertNotIn("required_assignment_numbers", context)
+
+    async def test_relative_deadlines_cross_midnight_month_and_year_locally(self):
+        for current, expression, due in (
+            (datetime(2026, 10, 11, 23, 45), "через 30 минут", "2026-10-12 00:15"),
+            (datetime(2026, 12, 31, 23, 50), "через 30 минут", "2027-01-01 00:20"),
+            (datetime(2028, 2, 28, 23, 30), "через 1 час", "2028-02-29 00:30"),
+            (datetime(2026, 10, 11, 23, 0, tzinfo=timezone(timedelta(hours=7))),
+             "через 2 часа 15 минут", "2026-10-12 01:15"),
+            (NOW.replace(second=45), "через 5 часов", "2026-10-11 15:30"),
+        ):
+            with self.subTest(current=current, expression=expression):
+                value = await self.parser.parse("Лаба по Питону " + expression, current)
+                self.assertEqual(value["due_date"], due)
+                self.assertEqual(value["subject"], "Python")
+
+    async def test_relative_deadline_must_match_other_calendar_or_clock_hints(self):
+        for expression, due in (
+            ("сегодня через 2 часа", "2026-10-11 12:30"),
+            ("через 36 часов", "2026-10-12 22:30"),
+            ("завтра через 36 часов", "2026-10-12 22:30"),
+            ("через 2 часа в 12:30", "2026-10-11 12:30"),
+            ("сегодня через 36 часов", None),
+            ("завтра через 2 часа", None),
+            ("15 октября через 2 часа", None),
+            ("через 2 часа в 18:00", None),
+            ("через 2 часа к первой паре", None),
+            ("через 1 день 2 часа", None),
+        ):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба по БД " + expression, due)
+
+    async def test_ambiguous_approximate_negated_and_fractional_offsets_are_not_guessed(self):
+        for expression in (
+            "через 5 часов или через 6 часов", "через 5 часов и через 5 часов",
+            "через 5 часов или 10 минут", "через 5 часов после начала работы",
+            "через 24 часа, но не завтра",
+            "не через 5 часов", "не раньше чем через 5 часов", "примерно через 5 часов",
+            "через примерно 5 часов", "через 1,5 часа", "через 1.5 часа",
+            "через полтора часа", "через пять часов", "через час", "через полчаса",
+            "через 2-3 часа", "через -2 часа", "через 0 часов", "через 0 минут",
+            "через 2 часа 30", "через 2 часа с половиной", "через 2 часа или позже",
+            "через 2 часа МСК", "через 999999999999999999999999 часов",
+        ):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба по БД " + expression, None)
+
+    async def test_elapsed_work_durations_are_not_deadlines_or_work_numbers(self):
+        for expression in ("через 2 часа работы", "через 30 минут на выполнение"):
+            with self.subTest(expression=expression):
+                value = await self.check_date("Лаба по БД " + expression, None)
+                self.assertNotIn("№2", value["task"])
+                self.assertNotIn("№30", value["task"])
+        text = "Лаба 3 по Python: решить задачи 2.1 и 2.3 через 5 часов"
+        value = await self.check_date(text, "2026-10-11 15:30")
+        self.assertEqual(value["task"], "Лабораторная работа №3: решить задачи 2.1 и 2.3")
+        _, content = self.parser._messages(text, NOW)
+        self.assertEqual(json.loads(content)["required_assignment_numbers"], ["2.1", "2.3", "3"])
+
     async def test_russian_clock_expressions_preserve_hours_and_minutes(self):
         for expression, expected_time in (
             ("в 6 вечера", "18:00"),
@@ -127,6 +219,132 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expression=expression):
                 await self.check_date("лаба 3 по БД завтра " + expression,
                                       "2026-10-12 " + expected_time)
+
+    async def test_bare_hours_survive_punctuation_and_trailing_instructions(self):
+        for text in (
+            "Сдать завтра до 18, скинуть код по Питону",
+            "Сдать завтра до 18 по БД",
+            "Завтра в 18.",
+            "Завтра к 18 отправить код по Python",
+            "Лаба 3 по БД завтра до 18!",
+        ):
+            with self.subTest(text=text):
+                await self.check_date(text, "2026-10-12 18:00")
+        value = await self.check_date("Лаба 3 по БД завтра до 18, отправить код", "2026-10-12 18:00")
+        self.assertIn("отправить код", value["task"])
+
+    async def test_bare_clock_detection_keeps_calendar_and_exercise_numbers(self):
+        for text, due, details in (
+            ("Лаба 3 по БД до 15 октября", "2026-10-15 23:59", "№3"),
+            ("Лаба 3 по БД до 15.10", "2026-10-15 23:59", "№3"),
+            ("Лаба 3 по БД завтра в 2 задаче исправить ошибки", "2026-10-12 23:59", "в 2 задаче"),
+            ("Лаба 3 по БД завтра в 2-й задаче исправить ошибки", "2026-10-12 23:59", "в 2-й задаче"),
+            ("Лаба 3 по БД завтра решить задачи с 1 до 3", "2026-10-12 23:59", "с 1 до 3"),
+            ("Лаба 3 по БД завтра в 2 группе подготовить отчёт", "2026-10-12 23:59", "в 2 группе"),
+            ("Реферат по БД завтра до 10 страниц", "2026-10-12 23:59", "до 10 страниц"),
+            ("Лаба 3 по БД завтра сократить код до 18 строк", "2026-10-12 23:59", "до 18 строк"),
+        ):
+            with self.subTest(text=text):
+                value = await self.check_date(text, due)
+                self.assertIn(details, value["task"])
+        await self.check_date("Лаба 3 по БД завтра к 2-й паре", None)
+        await self.check_date("Лаба 3 по БД завтра не в 18, отправить код", None)
+
+    async def test_task_quantities_never_become_bare_hours_or_disappear(self):
+        for detail in ("выполнить в 2 файлах", "покрыть код до 10 тестов",
+                       "увеличить число потоков до 20", "увеличить до 20",
+                       "сократить число записей до 15", "ограничить размер до 10",
+                       "сжать архив до 1,5 ГБ"):
+            with self.subTest(detail=detail):
+                value = await self.check_date("Лаба 3 по БД завтра " + detail, "2026-10-12 23:59")
+                self.assertIn(detail, value["task"])
+        for text in ("Лаба 3 по БД: увеличить число потоков, сдать завтра до 18",
+                     "Лаба 3 по БД: увеличить число потоков завтра до 18"):
+            with self.subTest(text=text):
+                await self.check_date(text, "2026-10-12 18:00")
+        await self.check_date("Лаба 3 по БД: увеличить число потоков в пятницу до 18", "2026-10-16 18:00")
+
+    async def test_bare_hour_alternatives_and_ranges_require_one_exact_clock(self):
+        for expression in ("в 18 или 20", "в 18 и 20", "с 18 до 20", "с 18 до 20 часов"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, None)
+        for detail in ("решить задачи с 1 до 3", "увеличить число потоков с 1 до 3",
+                       "увеличить с 1 до 3", "добавить с 1 до 3 файлов"):
+            with self.subTest(detail=detail):
+                value = await self.check_date("Лаба 3 по БД завтра " + detail, "2026-10-12 23:59")
+                self.assertIn(detail, value["task"])
+
+    async def test_lower_clock_bounds_require_an_exact_deadline(self):
+        for expression in ("после 18:00", "после 6 вечера", "не раньше чем в 18:00", "не ранее 18"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, None)
+        for expression in ("не позже 18:00", "не позднее 18:00"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, "2026-10-12 18:00")
+        for expression in ("не после 18, а в 17", "не ранее 18, а в 17"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, "2026-10-12 17:00")
+        await self.check_date("Лаба 3 по БД завтра после 2 заданий", "2026-10-12 23:59")
+
+    async def test_clock_alternatives_are_ambiguous_for_every_clock_format(self):
+        for expression in ("в 18:00 или 20", "в 18:00 и 20", "в 6 вечера или 7",
+                           "в 6 ч. вечера или 7", "в полдень или 18", "в полночь или 1"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, None)
+
+    async def test_quantity_after_clock_is_preserved_without_creating_an_alternative(self):
+        for expression, detail in (("в 18 и 20 тестов", "20 тестов"),
+                                   ("в 18 и 2 задачи", "2 задачи"),
+                                   ("в 18:00 и 20 тестов", "20 тестов"),
+                                   ("в 18 и 2 часа на выполнение", "2 часа на выполнение")):
+            with self.subTest(expression=expression):
+                result = await self.check_date("Лаба 3 по БД завтра " + expression, "2026-10-12 18:00")
+                self.assertIn(detail, result["task"])
+
+    async def test_dotted_clock_abbreviations_keep_part_of_day_and_minutes(self):
+        for expression, clock in (
+            ("в 6 ч. вечера", "18:00"),
+            ("в 6ч. вечера", "18:00"),
+            ("в 6 час. вечера", "18:00"),
+            ("в 6 ч. 30 мин. вечера", "18:30"),
+            ("в 6 ч 30 мин. вечера", "18:30"),
+            ("в 6 ч. утра", "06:00"),
+        ):
+            with self.subTest(expression=expression):
+                value = await self.check_date("Лаба 3 по БД завтра " + expression, "2026-10-12 " + clock)
+                self.assertEqual(value["task"], "Лабораторная работа №3")
+        await self.check_date("Лаба 3 по БД завтра в 6 ч. 99 мин. вечера", None)
+
+    async def test_dotted_units_keep_work_durations_and_timezone_guards(self):
+        value = await self.check_date(
+            "Лаба 3 по БД: выполнить за 2 ч. 30 мин.; сдать завтра", "2026-10-12 23:59")
+        self.assertIn("2 ч. 30 мин.", value["task"])
+        await self.check_date("Лаба 3 по БД через 2 ч. 30 мин.", "2026-10-11 13:00")
+        for expression in ("в 18 ч. МСК", "в 6 ч. 30 мин. вечера МСК", "в 6 вечера UTC"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД завтра " + expression, None)
+
+    async def test_negated_week_context_and_lower_bounds_require_an_actual_deadline(self):
+        for expression in (
+            "не на следующей неделе в пятницу",
+            "не раньше чем в пятницу",
+            "не ранее чем до 15 октября",
+            "после 15 октября",
+            "после 15.10.2026",
+        ):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД " + expression, None)
+        await self.check_date("Лаба 3 по БД после 15 октября до 16 октября", "2026-10-16 23:59")
+        await self.check_date("Лаба 3 по БД до 15 октября, но не на следующей неделе в пятницу",
+                              "2026-10-15 23:59")
+        await self.check_date("Лаба 3 по БД не позже чем в пятницу", "2026-10-16 23:59")
+
+    async def test_detached_negated_week_never_redefines_a_positive_weekday(self):
+        for expression in ("в пятницу, но не на следующей неделе",
+                           "в пятницу, но не на этой неделе",
+                           "до 15 октября, но не на следующей неделе"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД " + expression, None)
 
     async def test_incomplete_and_ambiguous_clock_expressions_require_manual_input(self):
         for expression in (
@@ -203,6 +421,23 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(value["task"], expected_task)
                 self.assertEqual(value["status"], "ok")
 
+    async def test_instructions_before_work_type_keep_exercises_and_content(self):
+        for text, expected in (
+            ("Решить задачи 2.1 и 2.3, ДЗ по БД завтра", ("2.1", "2.3")),
+            ("Написать SELECT запросы, лабораторная №3 по БД завтра", ("№3", "SELECT запросы")),
+            ("Решить задачи 2.1 и 2.3, лаба 3 по БД: описать алгоритм завтра",
+             ("№3", "2.1", "2.3", "описать алгоритм")),
+        ):
+            with self.subTest(text=text):
+                value = await self.check_date(text, "2026-10-12 23:59")
+                for detail in expected:
+                    self.assertIn(detail, value["task"])
+        for text in ("Нужно выполнить лабу 3 по БД завтра", "БД: лаба 3 завтра",
+                     "По БД до пятницы лаба 3"):
+            with self.subTest(text=text):
+                result = await self.parser.parse(text, NOW)
+                self.assertEqual(result["task"], "Лабораторная работа №3")
+
     async def test_day_of_month_is_not_a_work_number(self):
         for text in ("БД: лаба 15 октября", "БД: лаба 15-го октября", "БД: лаба 15-е октября",
                      "БД: лаба 15.10", "БД: лаба 2026-10-15"):
@@ -230,6 +465,29 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(expression=expression):
                 await self.check_date("Реферат " + expression, expected)
+
+    async def test_adjacent_weekdays_confirm_far_future_calendar_dates(self):
+        for expression, due in (
+            ("1 января 2027 (пятница)", "2027-01-01 23:59"),
+            ("пятница, 2027-01-01", "2027-01-01 23:59"),
+            ("31.12.2026 (четверг)", "2026-12-31 23:59"),
+            ("29 февраля 2028 (вторник)", "2028-02-29 23:59"),
+        ):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД " + expression, due)
+        await self.check_date("Лаба 3 по БД 1 января 2027 (четверг)", None)
+        await self.check_date("Лаба 3 по БД 15 октября или в пятницу", None)
+
+    async def test_malformed_named_calendar_year_is_not_silently_ignored(self):
+        for expression in ("15 октября 20260", "15 октября 26 года", "15 октября 202"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД " + expression, None)
+        for expression in ("15 октября 18:00", "15 октября 18 часов", "15 октября 6 вечера"):
+            with self.subTest(expression=expression):
+                await self.check_date("Лаба 3 по БД " + expression, "2026-10-15 18:00")
+        leap_now = datetime(2028, 2, 28, 10, 30)
+        result = await self.parser.parse("Лаба 3 по БД 29 февраля 20280", leap_now)
+        self.assertEqual(result["status"], "manual_input_required")
 
     async def test_weekday_nearest_and_next_calendar_week(self):
         monday = datetime(2026, 10, 12, 10, 30)
@@ -271,8 +529,8 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 value = await self.check_date(text, due)
                 self.assertIn(duration, value["task"])
-        await self.check_date("Лаба по БД сегодня через 2 часа", None)
-        await self.check_date("Лаба по БД через 36 часов", None)
+        await self.check_date("Лаба по БД сегодня через 2 часа", "2026-10-11 12:30")
+        await self.check_date("Лаба по БД через 36 часов", "2026-10-12 22:30")
 
     async def test_explicit_unsupported_timezone_requires_local_time(self):
         for expression in (
@@ -338,6 +596,212 @@ class RemoteTests(unittest.IsolatedAsyncioTestCase):
             result = await self.parser.parse("лаба 3 по БД до пятницы", NOW)
         self.assertEqual(result["parsing_method"], "llm")
         self.assertEqual(result["confidence"], 0.92)
+
+    async def test_corrected_clock_hints_allow_correct_model_answers(self):
+        for expression, clock in (
+            ("до 18, отправить код", "18:00"),
+            ("в 18.", "18:00"),
+            ("в 6 ч. вечера", "18:00"),
+            ("в 6 ч 30 мин. вечера", "18:30"),
+        ):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД завтра " + expression
+                due = "2026-10-12 " + clock
+                remote = dict(self.valid, due_date=due)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["parsing_method"], "llm")
+                self.assertEqual(result["due_date"], due)
+                self.assertIsNone(self.parser.last_remote_error)
+                _, content = self.parser._messages(text, NOW)
+                self.assertEqual(json.loads(content)["verified_due_date"], due)
+
+    async def test_quantity_context_does_not_force_model_to_use_a_false_clock(self):
+        for detail in ("выполнить в 2 файлах", "покрыть код до 10 тестов", "увеличить число потоков до 20"):
+            with self.subTest(detail=detail):
+                text = "Лаба 3 по БД завтра " + detail
+                remote = dict(self.valid, task="Лабораторная №3: " + detail, due_date="2026-10-12 23:59")
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["parsing_method"], "llm")
+                self.assertIn(detail, result["task"])
+                _, content = self.parser._messages(text, NOW)
+                self.assertEqual(json.loads(content)["verified_due_date"], "2026-10-12 23:59")
+
+    async def test_mixed_clock_alternatives_cannot_become_verified_model_deadlines(self):
+        for expression in ("в 18:00 или 20", "в 6 вечера или 7", "в полдень или 18"):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД завтра " + expression
+                remote = dict(self.valid, due_date="2026-10-12 18:00", confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertIsNone(result["due_date"])
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_quantity_after_clock_keeps_valid_model_reply_and_calendar_hint(self):
+        text = "Лаба 3 по БД завтра в 18 и 20 тестов"
+        remote = dict(self.valid, task="Лабораторная работа №3: 20 тестов", due_date="2026-10-12 18:00")
+        with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+            result = await self.parser.parse(text, NOW)
+        request.assert_called_once()
+        self.assertEqual(result["parsing_method"], "llm")
+        self.assertEqual(result["due_date"], remote["due_date"])
+        _, content = self.parser._messages(text, NOW)
+        self.assertEqual(json.loads(content)["verified_due_date"], remote["due_date"])
+
+    async def test_detached_negative_week_and_invalid_day_offsets_are_not_verified(self):
+        for expression in ("в пятницу, но не на следующей неделе", "в пятницу, но не на этой неделе",
+                           "через 1000 дней завтра", "через 1.5 дня завтра", "через два дня завтра"):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД " + expression
+                with patch.object(self.parser, "_request_llm", return_value=self.valid) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_negated_week_and_lower_bound_cannot_become_model_deadlines(self):
+        for expression, invented_due in (
+            ("не на следующей неделе в пятницу", "2026-10-16 23:59"),
+            ("не раньше чем в пятницу", "2026-10-16 23:59"),
+            ("после 15 октября", "2026-10-15 23:59"),
+        ):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД " + expression
+                remote = dict(self.valid, due_date=invented_due, confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                self.assertIsNone(result["due_date"])
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_adjacent_weekday_calendar_hint_is_consistent_with_model_result(self):
+        text = "Лаба 3 по БД 1 января 2027 (пятница)"
+        due = "2027-01-01 23:59"
+        with patch.object(self.parser, "_request_llm", return_value=dict(self.valid, due_date=due)) as request:
+            result = await self.parser.parse(text, NOW)
+        request.assert_called_once()
+        self.assertEqual(result["parsing_method"], "llm")
+        self.assertEqual(result["due_date"], due)
+        _, content = self.parser._messages(text, NOW)
+        self.assertEqual(json.loads(content)["verified_due_date"], due)
+        alternative = "Лаба 3 по БД 15 октября или в пятницу"
+        with patch.object(self.parser, "_request_llm", return_value=self.valid):
+            result = await self.parser.parse(alternative, NOW)
+        self.assertEqual(result["parsing_method"], "llm")
+        _, content = self.parser._messages(alternative, NOW)
+        self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_invalid_named_year_cannot_be_overridden_by_model_confidence(self):
+        for expression in ("15 октября 20260", "15 октября 26 года", "15 октября 202"):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД " + expression
+                remote = dict(self.valid, due_date="2026-10-15 23:59", confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_ambiguous_bare_clocks_are_not_given_verified_model_hints(self):
+        for expression in ("в 18 или 20", "в 18 и 20", "с 18 до 20", "с 18 до 20 часов"):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД завтра " + expression
+                remote = dict(self.valid, due_date="2026-10-12 18:00", confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_lower_clock_bounds_do_not_become_verified_model_deadlines(self):
+        for expression in ("после 18:00", "после 6 вечера", "не раньше чем в 18:00", "не ранее 18"):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД завтра " + expression
+                remote = dict(self.valid, due_date="2026-10-12 18:00", confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+        for expression, due in (("не позже 18:00", "2026-10-12 18:00"),
+                                ("не после 18:00, а в 17:00", "2026-10-12 17:00")):
+            with self.subTest(expression=expression):
+                with patch.object(self.parser, "_request_llm", return_value=dict(self.valid, due_date=due)):
+                    result = await self.parser.parse("Лаба 3 по БД завтра " + expression, NOW)
+                self.assertEqual(result["parsing_method"], "llm")
+                self.assertEqual(result["due_date"], due)
+
+    async def test_lost_model_exercises_fall_back_to_preserved_prefix_instructions(self):
+        text = "Решить задачи 2.1 и 2.3, лаба 3 по БД завтра"
+        for task, expected_method in (("Лабораторная №3", "regex_fallback"),
+                                      ("Лабораторная №3: решить задачи 2.1 и 2.3", "llm")):
+            with self.subTest(task=task):
+                remote = dict(self.valid, task=task, due_date="2026-10-12 23:59")
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["parsing_method"], expected_method)
+                self.assertIn("2.1", result["task"])
+                self.assertIn("2.3", result["task"])
+                self.assertIn("№3", result["task"])
+
+    async def test_relative_llm_date_must_equal_exact_offset_even_at_high_confidence(self):
+        text = "Через 5 часов нужно скинуть код по Питону"
+        for due, method in (("2026-10-11 15:30", "llm"), ("2026-10-11 15:31", "regex_fallback"),
+                            ("2026-10-12 15:30", "regex_fallback")):
+            with self.subTest(due=due):
+                remote = dict(self.valid, subject="Питон", task="Скинуть код", due_date=due, confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["due_date"], "2026-10-11 15:30")
+                self.assertEqual(result["parsing_method"], method)
+                self.assertEqual(result["subject"], "Python")
+                self.assertEqual(self.parser.last_remote_error, None if method == "llm" else "response")
+
+    async def test_invalid_relative_expression_cannot_be_resolved_by_remote_guess(self):
+        for expression in (
+            "сегодня через 36 часов", "через 5 часов или через 6 часов", "не через 5 часов",
+            "через 5 часов или 10 минут", "через 5 часов после начала работы",
+            "через 24 часа, но не завтра",
+            "через полтора часа", "через 1.5 часа", "через 1,5 часа", "через пять часов",
+            "через 2 часа работы", "через 30 минут на выполнение", "через 2 часа в 18:00",
+        ):
+            with self.subTest(expression=expression):
+                text = "Лаба 3 по БД " + expression
+                remote = dict(self.valid, due_date="2026-10-11 15:30", confidence=1)
+                with patch.object(self.parser, "_request_llm", return_value=remote) as request:
+                    result = await self.parser.parse(text, NOW)
+                request.assert_called_once()
+                self.assertEqual(result["status"], "manual_input_required")
+                self.assertEqual(self.parser.last_remote_error, "response")
+                _, content = self.parser._messages(text, NOW)
+                self.assertNotIn("verified_due_date", json.loads(content))
+
+    async def test_relative_llm_python_subject_forms_are_normalized(self):
+        for subject in ("Python", "python", "Питон", "Питону"):
+            with self.subTest(subject=subject):
+                remote = dict(self.valid, subject=subject, task="Лаба №3", due_date="2026-10-11 12:45")
+                with patch.object(self.parser, "_request_llm", return_value=remote):
+                    result = await self.parser.parse("Лаба 3 по Питону через 2 часа 15 минут", NOW)
+                self.assertEqual(result["parsing_method"], "llm")
+                self.assertEqual(result["subject"], "Python")
 
     async def test_negated_date_cannot_be_selected_or_sent_as_verified_hint(self):
         for expression, due, expected in (
@@ -533,7 +997,7 @@ class RemoteTests(unittest.IsolatedAsyncioTestCase):
     async def test_untrusted_remote_cannot_override_past_week_or_timezone(self):
         for expression in (
             "до прошлой пятницы", "до пятницы на этой неделе",
-            "завтра в 18:00 МСК", "2026-10-12T18:00+0300", "сегодня через 2 часа",
+            "завтра в 18:00 МСК", "2026-10-12T18:00+0300", "сегодня через 36 часов",
         ):
             with self.subTest(expression=expression):
                 text = "Лаба по БД " + expression
@@ -559,6 +1023,17 @@ class RemoteTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.parser, "_request_llm", side_effect=URLError("offline")):
             result = await self.parser.parse("лаба завтра", NOW)
         self.assertEqual(result["parsing_method"], "regex_fallback")
+        self.assertEqual(self.parser.last_remote_error, "network")
+
+    async def test_wrapped_transport_timeout_keeps_timeout_diagnostic(self):
+        for error in (TimeoutError("timeout"), URLError(TimeoutError("timeout"))):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(self.parser, "_request_llm", side_effect=error) as request:
+                result = await self.parser.parse("Лаба 3 по БД завтра", NOW)
+                request.assert_called_once()
+            self.assertEqual(result["parsing_method"], "regex_fallback")
+            self.assertEqual(result["due_date"], "2026-10-12 23:59")
+            self.assertEqual(self.parser.last_remote_error, "timeout")
 
     async def test_timeout_has_bounded_total_wait(self):
         parser = ParserEngine(api_key="test", model="test", timeout=0.01)
@@ -784,8 +1259,8 @@ class RemoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.get_header("X-api-key"), "test-key")
         self.assertLessEqual(opener.call_args.kwargs["timeout"], 5)
 
-    def test_timeout_leaves_margin_within_three_second_target(self):
-        self.assertEqual(ParserEngine(timeout=30).timeout, 2.5)
+    def test_timeout_is_capped_at_five_seconds(self):
+        self.assertEqual(ParserEngine(timeout=30).timeout, 5.0)
         for value in (0, -1, float("inf"), float("nan")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ParserEngine(timeout=value)

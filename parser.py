@@ -1,6 +1,6 @@
 """Extract coursework and local deadline dates from short Russian messages.
 
-The optional remote parser supports GigaChat and Anthropic. All validation and
+The optional remote parser supports compatible APIs, GigaChat and Anthropic. All validation and
 the fallback parser work using the Python standard library alone.
 """
 
@@ -21,7 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from config import MAX_LLM_TIMEOUT
-from llm import GigaChatClient, LLMError
+from llm import GigaChatClient, LLMError, OPENAI_CHAT_URL, OpenAICompatibleClient, RequestWorker
 from models import MAX_SUBJECT_LENGTH, MAX_TASK_LENGTH, clean_field
 
 
@@ -137,6 +137,7 @@ _WEEKDAYS = (
     (r"суббот(?:а|у|ы|е|ой)|сб", 5),
     (r"воскресень(?:е|я|ю|ем|и)|вс", 6),
 )
+_PYTHON_SUBJECT = r"\b(?:python|питон(?:а|у|ом|е)?)\b"
 _SUBJECTS = (
     (r"\b(?:бд|баз(?:а|ы|ам|ах|ами|у)?\s+данных)\b", "Базы данных"),
     (r"\b(?:матан(?:ализ|а|у|ом)?|мат(?:ематическ(?:ий|ому|ого))?\.?\s*анализ(?:а|у|ом)?)\b", "Математический анализ"),
@@ -149,6 +150,7 @@ _SUBJECTS = (
     (r"\b(?:истори\w*)\b", "История"),
     (r"\b(?:ос|операционн\w*\s+систем\w*)\b", "Операционные системы"),
     (r"\b(?:компьютерн\w*\s+сет\w*|сетям|сети)\b", "Компьютерные сети"),
+    (_PYTHON_SUBJECT, "Python"),
     (r"\b(?:прог(?:а|у|е|и)|программирован\w*)\b", "Программирование"),
 )
 
@@ -195,6 +197,15 @@ def _task(text: str) -> str:
                     label += f" №{number.group('number')}"
                     tail = tail[number.end():]
             details = _task_details(tail, _subject(text))
+            prefix = _task_details(text[:match.start()], _subject(text))
+            for subject_pattern, _ in _SUBJECTS:
+                prefix = re.sub(rf"^(?:{subject_pattern})\s*(?:[:—–-]\s*|$)", "", prefix, flags=re.IGNORECASE)
+            boilerplate = {
+                "сдать", "выполнить", "сделать", "нужно", "надо", "задали", "нам", "мне", "вам",
+                "пожалуйста", "на", "выполнение", "подготовить", "срочно", "до", "к", "в", "и",
+            }
+            if prefix and not set(re.findall(r"\w+", prefix.lower())).issubset(boilerplate):
+                details = prefix + (f"; {details}" if details else "")
             return (label + (f": {details}" if details else ""))[:MAX_TASK_LENGTH]
     return text[:MAX_TASK_LENGTH]
 
@@ -213,13 +224,27 @@ _ASSIGNMENT_LABEL = (
 _ASSIGNMENT_NUMBER = r"\d+(?:\.\d+)*(?:\s*[-–—]\s*\d+(?:\.\d+)*)?"
 _NUMERIC_DATE = r"(?<![\d.\-/])(\d{1,2})([./-])(\d{1,2})(?:\2(\d{4}|\d{2}))?(?![\d.\-/])"
 _EXACT_DAY_TIME = r"\b(?:полдень|полуд(?:ня|ню|нем)|полночь|полуночи|полночью)\b"
+_HOUR_UNIT = r"(?:час(?:а|ов)?|ч)(?:\b|(?=\d))\.?"
+_MINUTE_UNIT = r"(?:минут(?:а|ы|у)?|мин|м)\b\.?"
+_LOWER_CLOCK_PREFIX = r"\b(?:после|не\s+(?:раньше|ранее))\s+(?:чем\s+)?(?:(?:в|к|до)\s+)?"
+_LOWER_CLOCK = re.compile(
+    _LOWER_CLOCK_PREFIX + rf"(?P<clock>\d+(?::[\d:]*|\s*{_HOUR_UNIT}(?:\s*\d+\s*{_MINUTE_UNIT})?)?"
+    r"(?:\s*(?:утра|дня|вечера|ночи)\b)?)"
+)
+_RELATIVE_TIME = re.compile(
+    rf"\bчерез\s+(?:(?P<hours>\d+)\s*{_HOUR_UNIT}"
+    rf"(?:\s*(?:и\s+)?(?P<minutes>\d+)\s*{_MINUTE_UNIT})?"
+    rf"|(?P<only_minutes>\d+)\s*{_MINUTE_UNIT})"
+)
+_RELATIVE_DAYS = re.compile(r"\bчерез\s+(\d+)\s+(?:день|дня|дней|сутки|суток)\b")
 _NEGATED_DATE = re.compile(
-    r"\bне\s+(?:(?:до|к|на|в|раньше|ранее)\s+)?(?:"
+    r"\b(?:не\s+(?:(?:раньше|ранее)\s+(?:чем\s+)?)?(?:(?:до|к|на|в)\s+)?|после\s+)(?:"
     r"\d{4}-\d{2}-\d{2}(?!\d)|"
     r"\d{1,2}[./-]\d{1,2}(?:[./-](?:\d{4}|\d{2}))?(?![\d./-])|"
     rf"\d{{1,2}}(?:-?(?:го|е))?\s+(?:{_MONTH_PATTERN}|числа)(?:\s+\d{{4}})?\b|"
     r"сегодня\b|завтра\b|послезавтра\b|через\s+\d+\s+(?:день|дня|дней|сутки|суток)\b|"
-    r"(?:(?:прошл\w*|следующ\w*|ближайш\w*|эт\w*|предыдущ\w*|минувш\w*)\s+)?"
+    r"(?:(?:прошл\w*|следующ\w*|ближайш\w*|эт\w*|текущ\w*|предыдущ\w*|минувш\w*)\s+)?"
+    r"(?:недел\w*\s*,?\s*(?:(?:до|к|на|в)\s+)?)?"
     + r"(?:" + "|".join(pattern for pattern, _ in _WEEKDAYS) + r")\b)"
 )
 _NEGATED_TIME = re.compile(
@@ -230,7 +255,8 @@ _NEGATED_TIME = re.compile(
 _TIMEZONE_NAME = r"(?:мск|msk|utc|gmt)"
 _UNSUPPORTED_TIMEZONE = re.compile(
     rf"(?:(?<!\d)\d{{1,2}}:\d{{2}}|\b(?:в|к|до)\s+\d{{1,2}})"
-    rf"\s*(?:час(?:а|ов)?|ч)?\s*[\[(]?\s*{_TIMEZONE_NAME}\b"
+    rf"\s*(?:{_HOUR_UNIT}(?:\s*\d{{1,2}}\s*{_MINUTE_UNIT})?)?"
+    rf"\s*(?:(?:утра|дня|вечера|ночи)\s*)?[\[(]?\s*{_TIMEZONE_NAME}\b"
     rf"|\b{_TIMEZONE_NAME}\s*\d{{1,2}}:\d{{2}}"
     rf"|\b(?:utc|gmt)\s*[+-]\s*\d{{1,2}}(?::?\d{{2}})?\b"
     rf"|\b(?:по|времени|часовом\s+поясе)\s+{_TIMEZONE_NAME}\b"
@@ -315,6 +341,11 @@ def _task_details(text: str, subject: str) -> str:
     if subject != "Не указан" and subject not in {label for _, label in _SUBJECTS}:
         text = re.sub(rf"\bпо\s+{re.escape(subject)}\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(_CLASS_REFERENCE, " ", text, flags=re.IGNORECASE)
+    text = re.sub(_RELATIVE_TIME.pattern,
+                  lambda match: match.group() if re.match(
+                      r"\s+(?:работы|на\s+(?:выполнение|подготовку|решение))\b", text[match.end():],
+                      re.IGNORECASE,
+                  ) else " ", text, flags=re.IGNORECASE)
     prefix = r"(?:\b(?:до|к|на|в)\s+)?"
     dates = (
         r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)",
@@ -330,7 +361,7 @@ def _task_details(text: str, subject: str) -> str:
                       text, flags=re.IGNORECASE)
     times = (
         r"(?<!\d)\d{1,2}:\d{1,2}(?::\d{1,2})?(?!\d)(?:\s*(?:утра|дня|вечера|ночи))?",
-        r"\b\d{1,2}\s*(?:час(?:а|ов)?|ч)(?:\b|(?=\d))(?:\s*\d{1,2}\s*(?:минут(?:а|ы)?|мин|м)\b)?(?:\s*(?:утра|дня|вечера|ночи))?",
+        rf"\b\d{{1,2}}\s*{_HOUR_UNIT}(?:\s*\d{{1,2}}\s*{_MINUTE_UNIT})?(?:\s*(?:утра|дня|вечера|ночи))?",
         r"\b\d{1,2}\s+(?:утра|дня|вечера|ночи)\b",
         _EXACT_DAY_TIME,
     )
@@ -338,7 +369,8 @@ def _task_details(text: str, subject: str) -> str:
         text = re.sub(prefix + pattern,
                       lambda match: match.group() if _is_duration(text, match.start(), match.end()) else " ",
                       text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(?:в|к|до)\s+\d{1,2}\s*$", " ", text, flags=re.IGNORECASE)
+    for match in reversed(_bare_clock_matches(text.lower().replace("ё", "е"))):
+        text = text[:match.start()] + " " + text[match.end():]
     details = " ".join(text.split()).strip(" \t,;:.—–-")
     if set(details.lower().split()) <= {"и", "или", "до", "к", "на", "в", "не", "а"}:
         return ""
@@ -366,13 +398,88 @@ def _clock_hour(hour: int, period: str | None) -> int:
     return hour
 
 
+def _is_quantity_context(prefix: str) -> bool:
+    quantity = re.search(
+        r"\b(?:количеств\w*|числ[оауе]|размер\w*|объем\w*|длин\w*|"
+        r"увелич\w*|уменьш\w*|сократ\w*|сниз\w*|повыс\w*|довес\w*|огранич\w*)"
+        r"(?:\s+[а-яa-z-]+){0,4}\s+$", prefix,
+    )
+    return quantity is not None and not re.search(
+        r"\b(?:сдать|отправить|прислать|скинуть|закончить|завершить|выполнить|"
+        r"срок|дедлайн|сегодня|завтра|послезавтра|"
+        + "|".join(pattern for pattern, _ in _WEEKDAYS) + r")\b", quantity.group(),
+    )
+
+
+def _bare_clock_matches(text: str) -> list[re.Match]:
+    """Find clocks like 'до 18, отправить код' without consuming work/date numbers."""
+    matches = []
+    for match in re.finditer(r"\b(?:в|к|до)\s+(\d+)\b", text):
+        after = text[match.end():]
+        if re.match(
+            rf"(?:[.,:/-]\d|-(?:го|й|я|е|му|ой|ую)\b|\s+(?:{_MONTH_PATTERN}|числа|"
+            rf"{_ASSIGNMENT_LABEL}|пар\w*|заняти\w*|лекци\w*|семинар\w*|"
+            r"групп\w*|вариант\w*|раздел\w*|глав\w*|семестр\w*|курс\w*|экземпляр\w*|"
+            r"страниц\w*|слов\w*|символ\w*|знак\w*|строк\w*|байт\w*|[кмг]б|"
+            r"файл\w*|тест\w*|поток\w*|процесс\w*|элемент\w*|запис\w*|таблиц\w*|"
+            r"столбц\w*|колон\w*|класс\w*|модул\w*|функци\w*|метод\w*|объект\w*|"
+            r"процент\w*|раз\w*|минут\w*|сут\w*|день|дня|дней|недел\w*|месяц\w*|год\w*|лет)\b)", after,
+        ):
+            continue
+        if _is_assignment_number(text, match.start(1), match.group(1)):
+            continue
+        if re.search(r"\b(?:от|с)\s+\d+(?:\.\d+)*\s*$", text[:match.start()]):
+            continue
+        if _is_quantity_context(text[:match.start()]):
+            continue
+        matches.append(match)
+    return matches
+
+
+def _has_clock_alternative(text: str, end: int) -> bool:
+    connector = re.match(r"\s+(?:или|и)\s+(?:(?:в|к|до)\s+)?", text[end:])
+    if connector is None:
+        return False
+    following = text[end + connector.end():]
+    if re.match(r"\d+:", following):
+        return True
+    duration = re.match(
+        rf"\d+\s*{_HOUR_UNIT}(?:\s*\d+\s*{_MINUTE_UNIT})?", following,
+    )
+    if duration is not None and _is_duration(following, 0, duration.end()):
+        return False
+    return any(match.start() == 0 for match in _bare_clock_matches("в " + following))
+
+
 def _time(text: str) -> tuple[int, int, bool]:
     if _NEGATED_TIME.search(text):
         raise ValueError("Уточните время сдачи вместо исключённого времени.")
     if _UNSUPPORTED_TIMEZONE.search(text):
         raise ValueError("Укажите дату и время в часовом поясе приложения.")
-    if re.search(r"\bчерез\s+\d+\s*(?:час(?:а|ов)?|ч)(?:\b|(?=\d))", text):
-        raise ValueError("Укажите точную дату и время вместо количества часов.")
+    for lower in _LOWER_CLOCK.finditer(text):
+        clock = lower.group("clock")
+        if re.fullmatch(r"\d+", clock) and not any(
+            candidate.start() == 0 for candidate in _bare_clock_matches("в " + text[lower.start("clock"):])
+        ):
+            continue
+        if _is_duration(text, lower.start("clock"), lower.end()):
+            continue
+        if ((lower.group().startswith("не ") or re.search(r"\bне\s+$", text[:lower.start()]))
+                and re.match(r"\s*,?\s*а\s+(?:в|к|до)\s+\d+\b", text[lower.end():])):
+            continue
+        raise ValueError("Укажите точное время сдачи вместо нижней границы времени.")
+    for interval in re.finditer(r"\bс\s+\d{1,2}\s+до\s+\d{1,2}\b", text):
+        if re.search(rf"\b(?:{_ASSIGNMENT_LABEL})\s*$", text[:interval.start()]):
+            continue
+        if _is_quantity_context(text[:interval.start()]):
+            continue
+        if re.match(
+            r"\s+(?:файл\w*|тест\w*|поток\w*|процесс\w*|элемент\w*|запис\w*|таблиц\w*|"
+            r"страниц\w*|слов\w*|символ\w*|знак\w*|строк\w*|байт\w*|[кмг]б|процент\w*|раз\w*)\b",
+            text[interval.end():],
+        ):
+            continue
+        raise ValueError("Укажите одно точное время вместо диапазона часов.")
     values: set[tuple[int, int]] = set()
     consumed: list[tuple[int, int]] = []
     period = r"утра|дня|вечера|ночи"
@@ -402,11 +509,13 @@ def _time(text: str) -> tuple[int, int, bool]:
         hour, minute = _clock_hour(int(hour_text), part_of_day), int(minute_text)
         if minute > 59:
             raise ValueError("Некорректное время.")
+        if _has_clock_alternative(text, match.end()):
+            raise ValueError("Укажите одно точное время вместо альтернативных часов.")
         values.add((hour, minute))
         consumed.append(match.span())
     word_time = re.compile(
         rf"(?<![\d:])(\d+)\s*(?:"
-        rf"(?:час(?:а|ов)?|ч)(?:\b|(?=\d))(?:\s*(\d+)\s*(?:минут(?:а|ы)?|мин|м)\b)?(?:\s*({period})\b)?"
+        rf"{_HOUR_UNIT}(?:\s*(\d+)\s*{_MINUTE_UNIT})?(?:\s*({period})\b)?"
         rf"|({period})\b)"
     )
     for match in word_time.finditer(text):
@@ -423,20 +532,25 @@ def _time(text: str) -> tuple[int, int, bool]:
             raise ValueError("Некорректное время.")
         if re.match(r"\s+\d+(?:\s|$)", text[match.end():]):
             raise ValueError("Уточните минуты в формате ЧЧ:ММ.")
+        if _has_clock_alternative(text, match.end()):
+            raise ValueError("Укажите одно точное время вместо альтернативных часов.")
         values.add((hour, minute))
         consumed.append(match.span())
-    bare_hour = re.compile(
-        r"\b(?:в|к|до)\s+(\d+)(?=\s*(?:$|(?:сегодня|завтра|послезавтра)\b))"
-    )
-    for match in bare_hour.finditer(text):
+    for match in _bare_clock_matches(text):
         if any(start <= match.start(1) < end for start, end in consumed):
             continue
+        if re.search(r"\bне\s+(?:(?:раньше|ранее)\s+(?:чем\s+)?)?$", text[:match.start()]):
+            raise ValueError("Уточните время сдачи вместо исключённого времени.")
+        if _has_clock_alternative(text, match.end()):
+            raise ValueError("Укажите одно точное время вместо альтернативных часов.")
         values.add((_clock_hour(int(match.group(1)), None), 0))
     after_named_time = False
     for match in re.finditer(_EXACT_DAY_TIME, text):
         if re.search(r"\bпосле\s+$", text[:match.start()]):
             after_named_time = True
             continue
+        if _has_clock_alternative(text, match.end()):
+            raise ValueError("Укажите одно точное время вместо альтернативных часов.")
         values.add((12 if match.group().startswith(("полд", "полуд")) else 0, 0))
     if not values:
         if after_named_time or re.search(
@@ -461,7 +575,9 @@ def _corrected_temporal_text(text: str) -> tuple[str | None, bool]:
         nonlocal changed, clock_only_correction
         old = match.group("old").rstrip(" ,;")
         try:
-            explicit_clock = _time(old)[2]
+            # Cancelling a lower bound must still count as a clock correction;
+            # its 'после'/'не раньше' prefix must not hide the old clock.
+            explicit_clock = _time(re.sub("^" + _LOWER_CLOCK_PREFIX, "", old))[2]
         except ValueError:
             explicit_clock = False
         old_date = _has_supported_date_expression(old)
@@ -477,7 +593,7 @@ def _corrected_temporal_text(text: str) -> tuple[str | None, bool]:
 
 
 def _positive_date_text(text: str) -> tuple[str, bool]:
-    """Exclude an explicitly negated date, while preserving 'не позже' deadlines."""
+    """Exclude negated dates and lower bounds, preserving 'не позже' deadlines."""
     positive, removed = _NEGATED_DATE.subn(" ", text)
     return positive, bool(removed)
 
@@ -531,6 +647,7 @@ def _date_candidates(normalized: str, now: datetime, hour: int, minute: int) -> 
         day, month_name, year = match.groups()
         month = next(number for stem, number in _MONTHS.items() if month_name.startswith(stem))
         candidates.append(_at_local_date(now, int(year) if year else now.year, month, int(day), hour, minute))
+        date_spans.append(match.span())
     # A bare day-of-month cannot supply a month, but a corrected message may
     # also contain a complete date which the model can select explicitly.
     incomplete = re.search(r"\b\d{1,2}(?:-го)?\s+числа\b", normalized) is not None
@@ -539,11 +656,19 @@ def _date_candidates(normalized: str, now: datetime, hour: int, minute: int) -> 
         if re.search(rf"\b{word}\b", normalized):
             day = now + timedelta(days=days)
             candidates.append(day.replace(hour=hour, minute=minute, second=0, microsecond=0))
-    for match in re.finditer(r"\bчерез\s+(\d{1,3})\s+(?:день|дня|дней|сутки|суток)\b", normalized):
+    for match in _RELATIVE_DAYS.finditer(normalized):
         day = now + timedelta(days=int(match.group(1)))
         candidates.append(day.replace(hour=hour, minute=minute, second=0, microsecond=0))
     for pattern, weekday in _WEEKDAYS:
         for match in re.finditer(rf"\b(?:{pattern})\b", normalized):
+            if any(
+                (end <= match.start() and re.fullmatch(r"[\s,()—–-]*", normalized[end:match.start()]))
+                or (match.end() <= start and re.fullmatch(r"[\s,()—–-]*", normalized[match.end():start]))
+                for start, end in date_spans
+            ):
+                # Adjacent calendar dates and weekdays describe one day. The
+                # caller checks their agreement before resolving candidates.
+                continue
             prefix = normalized[max(0, match.start() - 60):match.start()]
             past = r"(?:(?:поза)?прошл|минувш|предыдущ)\w*"
             past_week = (re.search(rf"\b{past}\s+$", prefix) is not None
@@ -568,19 +693,102 @@ def _date_candidates(normalized: str, now: datetime, hour: int, minute: int) -> 
     return candidates, incomplete
 
 
+def _relative_time(text: str, now: datetime) -> tuple[datetime | None, str]:
+    """Resolve one exact elapsed interval; leave ordinary clocks to _time."""
+    matches = []
+    for intro in re.finditer(r"\bчерез\s+", text):
+        # Inspect the first temporal unit. A later clock in “через 2 дня в
+        # 18 часов” must not turn an existing calendar expression into hours.
+        unit = re.match(
+            r"[^;!?]{0,60}?(?<![а-яa-z])(?P<unit>час(?:а|ов)?|ч|минут(?:а|ы|у)?|мин|м|"
+            r"день|дня|дней|сутки|суток)(?:\b|(?=\d))", text[intro.end():],
+        )
+        if unit is None:
+            continue
+        if unit["unit"] in {"день", "дня", "дней", "сутки", "суток"}:
+            if _RELATIVE_DAYS.match(text, intro.start()) is None:
+                raise ValueError("Укажите целое количество дней.")
+            if re.match(r"\s*(?:и\s+)?\d+\s*(?:час(?:а|ов)?|ч|минут(?:а|ы)?|мин)\b",
+                        text[intro.end() + unit.end():]):
+                raise ValueError("Уточните сочетание относительных сроков.")
+            continue
+        match = _RELATIVE_TIME.match(text, intro.start())
+        if match is None:
+            raise ValueError("Укажите целое количество часов или минут.")
+        before, after = text[:match.start()], text[match.end():]
+        if re.search(
+            r"\b(?:не|раньше|ранее|позже|позднее|примерно|приблизительно|около|минимум|максимум)"
+            r"(?:\s+чем)?\s*$", before,
+        ) or re.match(
+            r"\s*(?:[,;]\s*)?(?:и\s+)?(?:[+\-]?\d|с\s+половиной\b|полчаса\b|"
+            r"половин\w*\b|четверт\w*\b|работы\b|на\s+(?:выполнение|подготовку|решение)\b|"
+            r"или\s+(?:позже|раньше)\b|или\s+\d+\s*(?:час(?:а|ов)?|ч|минут(?:а|ы|у)?|мин|м)\b|"
+            r"после\b|[\[(]?\s*(?:мск|msk|utc|gmt)\b)", after,
+        ):
+            raise ValueError("Уточните точный срок вместо приблизительного времени или длительности работы.")
+        matches.append(match)
+    if not matches:
+        return None, text
+    if len(matches) != 1:
+        raise ValueError("Укажите один относительный срок.")
+    match = matches[0]
+    minutes = int(match["hours"] or 0) * 60 + int(match["minutes"] or match["only_minutes"] or 0)
+    if minutes <= 0:
+        raise ValueError("Количество часов или минут должно быть положительным.")
+    due = (now + timedelta(minutes=minutes)).replace(second=0, microsecond=0)
+    if due <= now:
+        raise ValueError("Укажите будущий срок.")
+    return due, text[:match.start()] + " " + text[match.end():]
+
+
+def _checked_date_candidates(text: str, now: datetime, *, excluded_date: bool = False) -> tuple[list[datetime], bool, bool]:
+    """Check relative arithmetic against every remaining calendar/clock hint."""
+    for calendar_year in re.finditer(
+        rf"\b\d{{1,2}}(?:-?(?:го|е))?\s+(?:{_MONTH_PATTERN})\s+(\d+)\b", text,
+    ):
+        after = text[calendar_year.end():]
+        if re.match(rf"(?::|\s*(?:{_HOUR_UNIT}|утра\b|дня\b|вечера\b|ночи\b))", after):
+            continue
+        if len(calendar_year.group(1)) != 4:
+            raise ValueError("Укажите полный корректный год из четырёх цифр.")
+    if re.search(
+        r"\bне\s+(?:(?:на|в|до|к)\s+)?"
+        r"(?:(?:прошл\w*|следующ\w*|ближайш\w*|эт\w*|текущ\w*|предыдущ\w*|минувш\w*)\s+)?"
+        r"недел\w*\b", text,
+    ):
+        # A detached 'но не на этой неделе' must not become the global
+        # calendar-week qualifier used to resolve another weekday in the text.
+        raise ValueError("Уточните неделю и точную дату сдачи.")
+    relative, effective = _relative_time(text, now)
+    hour, minute, explicit_time = _time(effective)
+    if relative is not None:
+        if excluded_date:
+            # A removed negative date may contradict the elapsed interval.
+            # Keep this combination manual instead of silently ignoring it.
+            raise ValueError("Уточните относительный срок и исключённую дату.")
+        if explicit_time and (hour, minute) != (relative.hour, relative.minute):
+            raise ValueError("Относительное и указанное время противоречат друг другу.")
+        hour, minute = relative.hour, relative.minute
+    if _class_time_missing(effective, explicit_time):
+        raise ValueError("Укажите время пары.")
+    if _calendar_weekday_conflict(effective, now, hour, minute):
+        raise ValueError("Дата и день недели противоречат друг другу.")
+    candidates, incomplete = _date_candidates(effective, now, hour, minute)
+    if relative is not None:
+        if incomplete or any(candidate != relative for candidate in candidates):
+            raise ValueError("Относительный и календарный сроки противоречат друг другу.")
+        return [relative], False, True
+    return candidates, incomplete, explicit_time
+
+
 def _extract_date(text: str, now: datetime) -> datetime | None:
     normalized = text.lower().replace("ё", "е")
     # Regex cannot decide which statement supersedes another. Keep the offline
     # fallback manual and let the configured model interpret the original text.
     if _corrected_temporal_text(normalized)[0] is not None:
         return None
-    normalized, _ = _positive_date_text(normalized)
-    hour, minute, explicit_time = _time(normalized)
-    if _class_time_missing(normalized, explicit_time):
-        return None
-    if _calendar_weekday_conflict(normalized, now, hour, minute):
-        return None
-    candidates, incomplete = _date_candidates(normalized, now, hour, minute)
+    normalized, excluded_date = _positive_date_text(normalized)
+    candidates, incomplete, _ = _checked_date_candidates(normalized, now, excluded_date=excluded_date)
     if not candidates or incomplete:
         return None
     unique = set(candidates)
@@ -612,6 +820,7 @@ def _has_supported_date_expression(text: str) -> bool:
         _NUMERIC_DATE,
         rf"\b\d{{1,2}}(?:-?(?:го|е))?\s+(?:{_MONTH_PATTERN}|числа)\b",
         r"\b(?:сегодня|завтра|послезавтра|через\s+\d+\s+(?:день|дня|дней|сутки|суток))\b",
+        _RELATIVE_TIME.pattern,
         *(rf"\b(?:{pattern})\b" for pattern, _ in _WEEKDAYS),
     )
     return any(not _is_assignment_number(text, match.start(), match.group())
@@ -630,14 +839,10 @@ def _remote_date_is_safe(text: str, due: str, now: datetime, local: dict[str, An
     effective = corrected if corrected is not None else normalized
     effective, excluded_date = _positive_date_text(effective)
     try:
-        hour, minute, explicit_time = _time(effective)
+        candidates, incomplete, explicit_time = _checked_date_candidates(effective, now, excluded_date=excluded_date)
         if clock_only_correction and not explicit_time:
             return False
-        if _class_time_missing(effective, explicit_time):
-            return False
-        if _calendar_weekday_conflict(effective, now, hour, minute):
-            return False
-        candidates, incomplete = _date_candidates(effective, now, hour, minute)
+        hour, minute, _ = _time(effective)
     except (ValueError, OverflowError, StopIteration):
         return False
     if corrected is None and local["due_date"] is not None:
@@ -672,23 +877,32 @@ class ParserEngine:
 
     def __init__(self, api_key: str = "", model: str = "", timeout: float = MAX_LLM_TIMEOUT,
                  api_url: str | None = None, use_llm: bool = True, *,
-                 provider: str = "anthropic", ca_bundle: str | Path | None = None) -> None:
+                 provider: str = "anthropic", ca_bundle: str | Path | None = None,
+                 chat_template_kwargs: dict[str, bool] | None = None) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Тайм-аут должен быть положительным числом.")
-        if provider not in {"anthropic", "gigachat"}:
+        if provider not in {"anthropic", "gigachat", "openai"}:
             raise ValueError("Неизвестный провайдер модели.")
         self.api_key = api_key
         self.model = model
         self.timeout = min(float(timeout), MAX_LLM_TIMEOUT)
         self.provider = provider
         self.ca_bundle = ca_bundle
-        self.api_url = api_url or ("https://api.giga.chat/v1/chat/completions" if provider == "gigachat"
-                                   else "https://api.anthropic.com/v1/messages")
+        self.api_url = api_url or {
+            "gigachat": "https://api.giga.chat/v1/chat/completions",
+            "anthropic": "https://api.anthropic.com/v1/messages",
+            "openai": OPENAI_CHAT_URL,
+        }[provider]
         self.use_llm = use_llm
         self.last_remote_error: str | None = None
+        self._worker = RequestWorker()
         self._gigachat = (GigaChatClient(api_key, model=model, timeout=self.timeout,
                                         api_url=self.api_url, ca_bundle=ca_bundle)
                           if provider == "gigachat" and model else None)
+        self._openai = (OpenAICompatibleClient(api_key, model=model, timeout=self.timeout,
+                                              api_url=self.api_url, ca_bundle=ca_bundle,
+                                              chat_template_kwargs=chat_template_kwargs)
+                        if provider == "openai" and model else None)
 
     async def parse(self, text: str, now: datetime | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
@@ -701,7 +915,7 @@ class ParserEngine:
                 if remaining <= 0:
                     raise asyncio.TimeoutError
                 value = await asyncio.wait_for(
-                    asyncio.to_thread(self._request_llm, clean, current, deadline=deadline), remaining)
+                    self._worker.run(self._request_llm, clean, current, deadline=deadline), remaining)
                 validated = self._validate_llm(value, current)
                 if time.monotonic() >= deadline:
                     raise asyncio.TimeoutError
@@ -721,9 +935,13 @@ class ParserEngine:
                 self.last_remote_error = "timeout"
             except HTTPError as exc:
                 self.last_remote_error = ("auth" if exc.code in {401, 403}
-                                          else "quota" if exc.code == 429 else "network")
+                                          else "quota" if exc.code == 429
+                                          else "request" if exc.code in {400, 404, 405, 413, 415, 422}
+                                          else "network")
+                exc.close()
             except URLError as exc:
-                self.last_remote_error = "tls" if isinstance(exc.reason, ssl.SSLError) else "network"
+                self.last_remote_error = ("timeout" if isinstance(exc.reason, TimeoutError)
+                                          else "tls" if isinstance(exc.reason, ssl.SSLError) else "network")
             except OSError as exc:
                 self.last_remote_error = "tls" if isinstance(exc, ssl.SSLError) else "network"
             except HTTPException:
@@ -750,14 +968,17 @@ class ParserEngine:
             "а не отменённую дату. Следующий день недели — день "
             "следующей календарной недели; ближайший — ближайшее будущее. "
             "subject — название учебной дисциплины, а не описание действия. "
-            "БД означает Базы данных. Если предмет не указан, subject=\"Не указан\". "
+            "БД означает Базы данных; Python, Питон и Питону означают Python. "
+            "Если предмет не указан, subject=\"Не указан\". "
+            "Точное «через N часов/минут» вычисляй от current_local_datetime, "
+            "включая переход суток; длительность выполнения работы не является дедлайном. "
             "В task сохраняй тип работы, полный номер задания (включая составной "
             "номер вроде 2.1) и содержательные инструкции. Числа календарной даты "
             "не считай номером задания. "
             "Если передан required_assignment_numbers, все эти номера должны "
             "присутствовать в task цифрами. "
             "Поле verified_due_date, если оно передано, вычислено приложением "
-            "по календарю и явно указанному времени: используй его как due_date "
+            "по календарю, явно указанному времени или точному относительному сроку: используй его как due_date "
             "без изменений, не вычисляй эту дату повторно."
         )
         context = {
@@ -785,6 +1006,8 @@ class ParserEngine:
         system, user_content = self._messages(text, now)
         if self._gigachat is not None:
             return self._gigachat.request(system, user_content, deadline=deadline)
+        if self._openai is not None:
+            return self._openai.request(system, user_content, deadline=deadline)
         body = json.dumps({
             "model": self.model,
             "max_tokens": 512,
@@ -841,7 +1064,7 @@ class ParserEngine:
         except ValueError:
             return None
         return {
-            "subject": checked_subject,
+            "subject": "Python" if re.fullmatch(_PYTHON_SUBJECT, checked_subject, re.IGNORECASE) else checked_subject,
             "task": checked_task,
             "due_date": checked_date,
             "confidence": float(confidence),

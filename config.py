@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import os
 import math
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from llm import MAX_REQUEST_TIMEOUT, OPENAI_CHAT_URL, OPENAI_DEFAULT_MODEL, validate_api_url
+
 ROOT = Path(__file__).resolve().parent
-MAX_LLM_TIMEOUT = 2.5
+MAX_LLM_TIMEOUT = MAX_REQUEST_TIMEOUT
 
 
 def load_env(path: Path) -> None:
@@ -57,6 +60,7 @@ class Settings:
     log_level: str = "INFO"
     llm_provider: str = "anthropic"
     llm_ca_bundle: Path | None = None
+    llm_chat_template_kwargs: dict[str, bool] | None = None
 
     @classmethod
     def from_env(cls, *, require_token: bool = False, env_file: Path | None = None) -> "Settings":
@@ -66,9 +70,9 @@ class Settings:
             interval = int(os.getenv("SCHEDULER_INTERVAL", "30"))
         except ValueError as exc:
             raise ValueError("LLM_TIMEOUT и SCHEDULER_INTERVAL должны быть числами") from exc
-        if not math.isfinite(timeout) or not 0 < timeout <= 5:
-            raise ValueError("LLM_TIMEOUT должен быть больше 0 и не больше 5 секунд")
-        # Accept earlier configuration files while keeping one bounded request budget.
+        if not math.isfinite(timeout) or not 0 < timeout <= MAX_LLM_TIMEOUT:
+            raise ValueError(f"LLM_TIMEOUT должен быть больше 0 и не больше {MAX_LLM_TIMEOUT:g} секунд")
+        # Configuration and transport share one bounded request budget.
         timeout = min(timeout, MAX_LLM_TIMEOUT)
         if not 5 <= interval <= 300:
             raise ValueError("SCHEDULER_INTERVAL должен быть от 5 до 300 секунд")
@@ -84,14 +88,32 @@ class Settings:
         if not database.is_absolute():
             database = ROOT / database
         provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-        if provider not in {"anthropic", "gigachat"}:
-            raise ValueError("LLM_PROVIDER должен быть anthropic или gigachat")
-        default_model = "GigaChat-2" if provider == "gigachat" else ""
-        default_url = ("https://api.giga.chat/v1/chat/completions" if provider == "gigachat"
-                       else "https://api.anthropic.com/v1/messages")
+        provider_defaults = {
+            "anthropic": ("", "https://api.anthropic.com/v1/messages"),
+            "gigachat": ("GigaChat-2", "https://api.giga.chat/v1/chat/completions"),
+            "openai": (OPENAI_DEFAULT_MODEL, OPENAI_CHAT_URL),
+        }
+        if provider not in provider_defaults:
+            raise ValueError("LLM_PROVIDER должен быть anthropic, gigachat или openai")
+        default_model, default_url = provider_defaults[provider]
         api_url = os.getenv("LLM_API_URL", default_url).strip()
-        if not api_url.startswith("https://"):
-            raise ValueError("LLM_API_URL должен использовать HTTPS")
+        try:
+            validate_api_url(api_url)
+        except ValueError:
+            raise ValueError("LLM_API_URL должен быть корректным HTTPS URL без учётных данных и пробелов") from None
+        chat_template_value = os.getenv("LLM_CHAT_TEMPLATE_KWARGS", "").strip()
+        chat_template_kwargs = None
+        if chat_template_value:
+            template_error = "LLM_CHAT_TEMPLATE_KWARGS должен быть JSON-объектом с ключами thinking/enable_thinking и логическими значениями"
+            try:
+                chat_template_kwargs = json.loads(chat_template_value)
+            except (ValueError, RecursionError):
+                raise ValueError(template_error) from None
+            if not isinstance(chat_template_kwargs, dict) or any(
+                key not in {"thinking", "enable_thinking"} or not isinstance(value, bool)
+                for key, value in chat_template_kwargs.items()
+            ):
+                raise ValueError(template_error) from None
         ca_value = os.getenv("LLM_CA_BUNDLE", "").strip()
         ca_bundle = None
         if ca_value:
@@ -110,6 +132,7 @@ class Settings:
             llm_api_url=api_url, llm_timeout=timeout,
             scheduler_interval=interval, log_level=level,
             llm_provider=provider, llm_ca_bundle=ca_bundle,
+            llm_chat_template_kwargs=chat_template_kwargs,
         )
 
     def now(self) -> datetime:

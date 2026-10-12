@@ -25,6 +25,7 @@ from publications import PublicationService
 
 logger = logging.getLogger(__name__)
 PAGE_SIZE = 4
+MAX_ENTITY_ID = 2**63 - 1
 
 HELP = (
     "<b>DeadlineRadar — учебные дедлайны</b>\n\n"
@@ -65,6 +66,13 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
         for row in rows
     ])
+
+
+def parse_callback_id(value: str) -> int:
+    entity_id = int(value)
+    if not 1 <= entity_id <= MAX_ENTITY_ID:
+        raise ValueError("Некорректный номер")
+    return entity_id
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -156,11 +164,11 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         page = min(max(page, 0), pages - 1)
         visible = items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
         rows = []
-        if not history:
-            for item in visible:
-                buttons = [(f"✅ Я сдал #{item['id']}", f"done:{item['id']}")]
-                if item["can_delete"]:
-                    buttons.append((f"🗑 #{item['id']}", f"remove:ask:{item['id']}"))
+        for item in visible:
+            buttons = [] if history else [(f"✅ Я сдал #{item['id']}", f"done:{item['id']}")]
+            if item["can_delete"]:
+                buttons.append((f"🗑 #{item['id']}", f"remove:ask:{item['id']}"))
+            if buttons:
                 rows.append(buttons)
         navigation = []
         if page > 0:
@@ -211,15 +219,25 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
             "Каждый участник должен открыть бота и нажать Start."
         )
 
-    async def join(message: Message, user_id: int, text: str) -> bool:
+    async def join(message: Message, user_id: int, text: str, *, start_payload: bool = False) -> bool:
         code = text.strip()
         if code.startswith("https://t.me/"):
             code = parse_qs(urlparse(code).query).get("start", [""])[0]
-        if code.startswith("g_"):
-            code = code[2:]
-        try:
-            group = database.join_group(user_id, code)
-        except ValueError:
+            start_payload = True
+        if start_payload:
+            code = code.removeprefix("g_")
+        codes = [code]
+        if not start_payload and code.startswith("g_"):
+            # A generated raw code may itself start with g_. Prefer it in full;
+            # retain support for a pasted bare start payload if it is not found.
+            codes.append(code[2:])
+        for candidate in codes:
+            try:
+                group = database.join_group(user_id, candidate)
+            except ValueError:
+                continue
+            break
+        else:
             await message.answer("Приглашение не найдено. Проверьте код или запросите ссылку у старосты.")
             return False
         await message.answer(f"Вы в группе <b>{escape(group['name'])}</b>. Задания доступны в /deadlines.")
@@ -227,7 +245,11 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
 
     async def show_settings(message: Message, user_id: int) -> None:
         enabled = database.get_user(user_id)["delivery_enabled"]
-        provider_name = "GigaChat" if getattr(settings, "llm_provider", "anthropic") == "gigachat" else "Anthropic"
+        provider = getattr(settings, "llm_provider", "anthropic")
+        provider_name = {"gigachat": "GigaChat", "anthropic": "Anthropic"}.get(provider, "совместимый API")
+        if (provider == "openai" and getattr(settings, "llm_api_url", "").rstrip("/")
+                == "https://deepcode.ci.nsu.ru/api/chat/completions"):
+            provider_name = "API НГУ"
         await message.answer(
             f"<b>Настройки и данные</b>\n\nЧасовой пояс: {escape(settings.timezone)}. "
             "Все участники используют этот часовой пояс. Если время не указано, срок — 23:59.\n"
@@ -274,7 +296,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
         if not database.get_user(message.from_user.id)["delivery_enabled"]:
             await message.answer("Уведомления выключены. Их можно включить в /settings.")
         if command.args and command.args.startswith("g_"):
-            await join(message, message.from_user.id, command.args)
+            await join(message, message.from_user.id, command.args, start_payload=True)
 
     @router.message(Command("help"))
     @router.message(F.text == "❓ Помощь")
@@ -479,7 +501,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
     @router.callback_query(F.data.startswith("done:"))
     async def done(query: CallbackQuery):
         try:
-            deadline_id = int(query.data.split(":")[1])
+            deadline_id = parse_callback_id(query.data.split(":")[1])
         except ValueError:
             await answer_callback(query, "Некорректный номер")
             return
@@ -494,7 +516,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
     async def remove(query: CallbackQuery):
         try:
             _, action, value = query.data.split(":")
-            deadline_id = int(value)
+            deadline_id = parse_callback_id(value)
         except ValueError:
             await answer_callback(query, "Некорректный номер")
             return
@@ -541,7 +563,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
     async def group_owner_action(query: CallbackQuery, state: FSMContext):
         try:
             action, value = query.data.split(":")
-            group = database.get_group_for_owner(query.from_user.id, int(value))
+            group = database.get_group_for_owner(query.from_user.id, parse_callback_id(value))
         except ValueError:
             group = None
         if not group:
@@ -560,7 +582,7 @@ def create_router(database, service, settings, bot_username: str, *, on_publicat
     async def leave(query: CallbackQuery):
         try:
             _, action, value = query.data.split(":")
-            group_id = int(value)
+            group_id = parse_callback_id(value)
             group = next((g for g in database.list_groups(query.from_user.id) if g["id"] == group_id), None)
             if not group or group["is_owner"]:
                 raise ValueError
