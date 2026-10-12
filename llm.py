@@ -24,6 +24,8 @@ OPENAI_DEFAULT_MODEL = "Qwen3.8-27B"
 MAX_RESPONSE_BYTES = 65_536
 TOKEN_REFRESH_MARGIN = 30.0
 MAX_REQUEST_TIMEOUT = 5.0
+USER_AGENT = "DeadlineRadar/1.0"
+REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "default"})
 _TIMEOUT_MESSAGE = "Время ожидания сервиса распознавания истекло."
 
 
@@ -146,7 +148,8 @@ class OpenAICompatibleClient:
 
     def __init__(self, api_key: str, model: str = OPENAI_DEFAULT_MODEL, timeout: float = MAX_REQUEST_TIMEOUT,
                  api_url: str = OPENAI_CHAT_URL, ca_bundle: Path | None = None, *,
-                 chat_template_kwargs: dict[str, bool] | None = None) -> None:
+                 chat_template_kwargs: dict[str, bool] | None = None,
+                 reasoning_effort: str | None = None) -> None:
         if (not isinstance(api_key, str) or not api_key.isascii()
                 or any(ord(character) < 32 or ord(character) == 127 for character in api_key)):
             raise ValueError("Некорректный ключ авторизации сервиса распознавания.")
@@ -162,6 +165,11 @@ class OpenAICompatibleClient:
         ):
             raise ValueError("Параметры шаблона модели должны содержать только булевы thinking/enable_thinking.")
         self.api_key = api_key.strip()
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError("Некорректный режим рассуждений сервиса распознавания.")
+        self.reasoning_effort = reasoning_effort
         self.model = model.strip()
         self.timeout = min(float(timeout), MAX_REQUEST_TIMEOUT)
         self.api_url = api_url
@@ -229,11 +237,14 @@ class OpenAICompatibleClient:
             }
             if self.chat_template_kwargs:
                 payload["chat_template_kwargs"] = dict(self.chat_template_kwargs)
+            if self.reasoning_effort is not None:
+                payload["reasoning_effort"] = self.reasoning_effort
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             request = Request(self.api_url, data=body, method="POST", headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": USER_AGENT,
             })
             try:
                 envelope = self._post(request, request_deadline)
@@ -292,6 +303,7 @@ class GigaChatClient(OpenAICompatibleClient):
                               "RqUID": str(uuid4()),
                               "Content-Type": "application/x-www-form-urlencoded",
                               "Accept": "application/json",
+                              "User-Agent": USER_AGENT,
                           })
         value = self._post(request, deadline)
         token, expires_at = value.get("access_token"), value.get("expires_at")

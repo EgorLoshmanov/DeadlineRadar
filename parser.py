@@ -878,7 +878,8 @@ class ParserEngine:
     def __init__(self, api_key: str = "", model: str = "", timeout: float = MAX_LLM_TIMEOUT,
                  api_url: str | None = None, use_llm: bool = True, *,
                  provider: str = "anthropic", ca_bundle: str | Path | None = None,
-                 chat_template_kwargs: dict[str, bool] | None = None) -> None:
+                 chat_template_kwargs: dict[str, bool] | None = None,
+                 reasoning_effort: str | None = None) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Тайм-аут должен быть положительным числом.")
         if provider not in {"anthropic", "gigachat", "openai"}:
@@ -901,7 +902,8 @@ class ParserEngine:
                           if provider == "gigachat" and model else None)
         self._openai = (OpenAICompatibleClient(api_key, model=model, timeout=self.timeout,
                                               api_url=self.api_url, ca_bundle=ca_bundle,
-                                              chat_template_kwargs=chat_template_kwargs)
+                                              chat_template_kwargs=chat_template_kwargs,
+                                              reasoning_effort=reasoning_effort)
                         if provider == "openai" and model else None)
 
     async def parse(self, text: str, now: datetime | None = None) -> dict[str, Any]:

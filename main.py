@@ -65,6 +65,7 @@ def create_parser(settings: Settings) -> ParserEngine:
         provider=getattr(settings, "llm_provider", "anthropic"),
         ca_bundle=getattr(settings, "llm_ca_bundle", None),
         chat_template_kwargs=getattr(settings, "llm_chat_template_kwargs", None),
+        reasoning_effort=getattr(settings, "llm_reasoning_effort", None),
     )
 
 
@@ -123,7 +124,7 @@ def check_llm_bounded(settings: Settings) -> int:
         return _print_llm_check(settings, "credentials", 0.0)
     values = {name: getattr(settings, name) for name in (
         "llm_api_key", "llm_model", "llm_api_url", "llm_timeout", "llm_provider",
-        "llm_chat_template_kwargs", "timezone",
+        "llm_chat_template_kwargs", "llm_reasoning_effort", "timezone",
     )}
     values["llm_ca_bundle"] = str(settings.llm_ca_bundle) if settings.llm_ca_bundle is not None else None
     values["now"] = settings.now().isoformat()

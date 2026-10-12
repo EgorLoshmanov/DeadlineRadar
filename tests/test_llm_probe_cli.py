@@ -23,7 +23,7 @@ class BoundedProbeTests(unittest.TestCase):
                         llm_provider="openai", llm_api_url="https://example.invalid/chat/completions",
                         bot_token="fixture-bot-token", **overrides)
 
-    def invoke(self, code, *, timeout=0.5):
+    def invoke(self, code, *, timeout=0.5, reasoning_effort=None):
         children = []
         commands = []
 
@@ -36,7 +36,8 @@ class BoundedProbeTests(unittest.TestCase):
         output = io.StringIO()
         started = time.monotonic()
         with patch("main.subprocess.Popen", side_effect=spawn), redirect_stdout(output):
-            result = check_llm_bounded(self.settings(llm_timeout=timeout))
+            result = check_llm_bounded(self.settings(llm_timeout=timeout,
+                                                    llm_reasoning_effort=reasoning_effort))
         return result, output.getvalue(), children, commands, time.monotonic() - started
 
     def test_valid_result_and_credentials_cross_only_the_private_pipe(self):
@@ -65,6 +66,17 @@ class BoundedProbeTests(unittest.TestCase):
         self.assertIn("Проверка остановлена", output)
         self.assertLess(elapsed, 2)
         self.assertIsNotNone(children[0].poll())
+
+    def test_reasoning_control_survives_probe_process_boundary(self):
+        code = (
+            "import json,sys; from main import create_parser; from config import Settings; "
+            "data=json.load(sys.stdin); data.pop('now'); parser=create_parser(Settings(**data)); "
+            "assert parser._openai.reasoning_effort=='none'; "
+            "print(json.dumps({'reason':None,'elapsed':0.01}))"
+        )
+        result, output, children, _, _ = self.invoke(code, timeout=2, reasoning_effort="none")
+        self.assertEqual(result, 0, output)
+        self.assertEqual(children[0].returncode, 0)
 
     def test_fallback_result_exits_without_waiting_for_stalled_http_thread(self):
         # Exercise the actual worker: an uninterruptible HTTP/DNS call must

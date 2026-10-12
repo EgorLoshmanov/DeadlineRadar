@@ -296,6 +296,35 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value.llm_api_url, "https://example.org/v1/chat/completions")
         self.assertEqual(value.llm_api_key, "example-key")
 
+    def test_reasoning_effort_is_optional_and_preserves_supported_modes(self):
+        os.environ["LLM_PROVIDER"] = "openai"
+        self.assertIsNone(self.settings().llm_reasoning_effort)
+        for raw in ("", "  ", "none", "low", "medium", "high", "default", " none "):
+            with self.subTest(raw=raw):
+                os.environ["LLM_REASONING_EFFORT"] = raw
+                self.assertEqual(self.settings().llm_reasoning_effort, raw.strip() or None)
+
+    def test_reasoning_effort_rejects_invalid_modes_and_other_providers(self):
+        os.environ["LLM_PROVIDER"] = "openai"
+        for raw in ("private-config-secret", "false", "{}", "NONE"):
+            with self.subTest(raw=raw):
+                os.environ["LLM_REASONING_EFFORT"] = raw
+                with self.assertRaisesRegex(ValueError, "LLM_REASONING_EFFORT") as raised:
+                    self.settings()
+                self.assertNotIn("private-config-secret", str(raised.exception))
+        os.environ["LLM_REASONING_EFFORT"] = "none"
+        for provider in ("anthropic", "gigachat"):
+            with self.subTest(provider=provider):
+                os.environ["LLM_PROVIDER"] = provider
+                with self.assertRaisesRegex(ValueError, "LLM_PROVIDER=openai"):
+                    self.settings()
+
+    def test_reasoning_effort_loads_from_file_and_process_override_can_disable_it(self):
+        self.env_file.write_text("LLM_PROVIDER=openai\nLLM_REASONING_EFFORT=none\n", encoding="utf-8")
+        self.assertEqual(self.settings().llm_reasoning_effort, "none")
+        os.environ["LLM_REASONING_EFFORT"] = ""
+        self.assertIsNone(self.settings().llm_reasoning_effort)
+
     def test_openai_keeps_process_overrides_and_explicit_empty_credentials(self):
         self.env_file.write_text(
             "LLM_PROVIDER=openai\nLLM_MODEL=file-model\nLLM_API_KEY=file-key\nLLM_TIMEOUT=5\n",

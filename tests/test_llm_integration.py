@@ -211,6 +211,17 @@ class ModelCheckTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(legacy=settings is legacy), patch("main.ParserEngine") as parser:
                 create_parser(settings)
                 self.assertEqual(parser.call_args.kwargs["chat_template_kwargs"], expected)
+                self.assertIsNone(parser.call_args.kwargs["reasoning_effort"])
+
+    def test_parser_receives_groq_reasoning_setting(self):
+        settings = Settings(llm_provider="openai", llm_api_key="fixture-groq-key",
+                            llm_model="qwen/qwen3.8-27b",
+                            llm_api_url="https://api.groq.com/openai/v1/chat/completions",
+                            llm_reasoning_effort="none")
+        parser = create_parser(settings)
+        self.assertEqual(parser._openai.reasoning_effort, "none")
+        self.assertEqual(parser._openai.model, "qwen/qwen3.8-27b")
+        self.assertEqual(parser._openai.chat_template_kwargs, {})
 
     async def test_empty_key_never_opens_network_telegram_or_database(self):
         settings = Settings(llm_provider="gigachat", llm_model="GigaChat-2")

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from llm import MAX_REQUEST_TIMEOUT, OPENAI_CHAT_URL, OPENAI_DEFAULT_MODEL, validate_api_url
+from llm import MAX_REQUEST_TIMEOUT, OPENAI_CHAT_URL, OPENAI_DEFAULT_MODEL, REASONING_EFFORTS, validate_api_url
 
 ROOT = Path(__file__).resolve().parent
 MAX_LLM_TIMEOUT = MAX_REQUEST_TIMEOUT
@@ -61,6 +61,7 @@ class Settings:
     llm_provider: str = "anthropic"
     llm_ca_bundle: Path | None = None
     llm_chat_template_kwargs: dict[str, bool] | None = None
+    llm_reasoning_effort: str | None = None
 
     @classmethod
     def from_env(cls, *, require_token: bool = False, env_file: Path | None = None) -> "Settings":
@@ -114,6 +115,12 @@ class Settings:
                 for key, value in chat_template_kwargs.items()
             ):
                 raise ValueError(template_error) from None
+        reasoning_effort = os.getenv("LLM_REASONING_EFFORT", "").strip() or None
+        if reasoning_effort is not None:
+            if reasoning_effort not in REASONING_EFFORTS:
+                raise ValueError("LLM_REASONING_EFFORT должен быть none, low, medium, high, default или пустым")
+            if provider != "openai":
+                raise ValueError("LLM_REASONING_EFFORT поддерживается только при LLM_PROVIDER=openai")
         ca_value = os.getenv("LLM_CA_BUNDLE", "").strip()
         ca_bundle = None
         if ca_value:
@@ -133,6 +140,7 @@ class Settings:
             scheduler_interval=interval, log_level=level,
             llm_provider=provider, llm_ca_bundle=ca_bundle,
             llm_chat_template_kwargs=chat_template_kwargs,
+            llm_reasoning_effort=reasoning_effort,
         )
 
     def now(self) -> datetime:

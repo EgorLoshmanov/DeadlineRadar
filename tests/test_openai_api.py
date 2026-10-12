@@ -57,6 +57,7 @@ class CompatibleTransportTests(unittest.TestCase):
             self.assertEqual(request.full_url, OPENAI_CHAT_URL)
             self.assertEqual(request.get_method(), "POST")
             self.assertEqual(request.get_header("Authorization"), "Bearer nsu-secret")
+            self.assertEqual(request.get_header("User-agent"), "DeadlineRadar/1.0")
             self.assertIsNone(request.get_header("X-api-key"))
             self.assertIsNone(request.get_header("Rquid"))
             payload = json.loads(request.data)
@@ -103,6 +104,24 @@ class CompatibleTransportTests(unittest.TestCase):
                     OpenAICompatibleClient("key", chat_template_kwargs=invalid)
                 self.assertNotIn("nsu-secret", str(raised.exception))
                 self.assertNotIn("private value", str(raised.exception))
+                opener.assert_not_called()
+
+    def test_reasoning_controls_are_optional_and_validated_before_network_access(self):
+        for effort in (None, "none", "low", "medium", "high", "default"):
+            with self.subTest(effort=effort):
+                client = OpenAICompatibleClient("key", reasoning_effort=effort)
+                with patch("llm.urlopen", return_value=completion()) as opener:
+                    client.request("rules", "text")
+                payload = json.loads(opener.call_args.args[0].data)
+                if effort is None:
+                    self.assertNotIn("reasoning_effort", payload)
+                else:
+                    self.assertEqual(payload["reasoning_effort"], effort)
+        for invalid in (True, [], {}, "private-config-secret", ""):
+            with self.subTest(invalid=invalid), patch("llm.urlopen") as opener:
+                with self.assertRaises(ValueError) as raised:
+                    OpenAICompatibleClient("key", reasoning_effort=invalid)
+                self.assertNotIn("private-config-secret", str(raised.exception))
                 opener.assert_not_called()
 
     def test_http_errors_are_categorized_sanitized_and_never_retried(self):
@@ -194,6 +213,27 @@ class CompatibleParserTests(unittest.IsolatedAsyncioTestCase):
         options = {"api_key": "nsu-secret", "model": OPENAI_DEFAULT_MODEL, "provider": "openai"}
         options.update(changes)
         return ParserEngine(**options)
+
+    async def test_groq_request_identifies_app_and_disables_reasoning(self):
+        endpoint = "https://api.groq.com/openai/v1/chat/completions"
+
+        def respond(request, **kwargs):
+            if request.get_header("User-agent") != "DeadlineRadar/1.0":
+                raise HTTPError(endpoint, 403, "Forbidden", {}, io.BytesIO(b"error code: 1010"))
+            self.assertEqual(request.full_url, endpoint)
+            self.assertEqual(request.get_header("Authorization"), "Bearer fixture-groq-key")
+            payload = json.loads(request.data)
+            self.assertEqual(payload["model"], "qwen/qwen3.8-27b")
+            self.assertEqual(payload["reasoning_effort"], "none")
+            self.assertNotIn("chat_template_kwargs", payload)
+            return completion()
+
+        with patch("llm.urlopen", side_effect=respond) as opener:
+            result = await self.parser(api_key="fixture-groq-key", model="qwen/qwen3.8-27b",
+                                       api_url=endpoint, reasoning_effort="none").parse(TEXT, NOW)
+        self.assertEqual(result["parsing_method"], "llm")
+        self.assertEqual(result["due_date"], RESULT["due_date"])
+        opener.assert_called_once()
 
     async def test_remote_result_uses_calendar_hints_and_existing_validation(self):
         with patch("llm.urlopen", return_value=completion()) as opener:
